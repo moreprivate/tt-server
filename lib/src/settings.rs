@@ -177,7 +177,7 @@ pub struct Settings {
     /// The metrics gathering request handler settings
     pub(crate) metrics: Option<MetricsSettings>,
     /// Path to the rules file for connection filtering.
-    /// If not specified or file doesn't exist, all connections are allowed by default.
+    /// If not specified, all connections are allowed by default.
     #[serde(default)]
     #[serde(skip_serializing)]
     #[serde(rename(deserialize = "rules_file"))]
@@ -1622,75 +1622,108 @@ fn deserialize_rules<'de, D>(deserializer: D) -> Result<Option<rules::RulesEngin
 where
     D: serde::de::Deserializer<'de>,
 {
-    let path = match deserialize_file_path(deserializer) {
-        Ok(path) => path,
-        Err(_) => {
-            // No rules file specified, default to allow all
-            return Ok(Some(rules::RulesEngine::default_allow()));
-        }
-    };
-
-    let content = match std::fs::read_to_string(&path) {
-        Ok(content) => content,
-        Err(e) => {
-            // Log warning but don't fail - default to allow all
-            eprintln!(
-                "Warning: Could not read rules file '{}': {}. Defaulting to allow all connections.",
-                path, e
-            );
-            return Ok(Some(rules::RulesEngine::default_allow()));
-        }
-    };
-
-    let rules_doc: Document = match content.parse() {
-        Ok(doc) => doc,
-        Err(e) => {
-            eprintln!("Warning: Could not parse rules file '{}': {}. Defaulting to allow all connections.", path, e);
-            return Ok(Some(rules::RulesEngine::default_allow()));
-        }
-    };
-
-    let rules_config = match rules_doc.get("rule").and_then(Item::as_array_of_tables) {
-        Some(rules_array) => {
-            let rules: Vec<rules::Rule> = rules_array
-                .iter()
-                .filter_map(|rule_table| {
-                    let cidr = rule_table
-                        .get("cidr")
-                        .and_then(Item::as_str)
-                        .map(|s| s.to_string());
-
-                    let client_random_prefix = rule_table
-                        .get("client_random_prefix")
-                        .and_then(Item::as_str)
-                        .map(|s| s.to_string());
-
-                    let action = rule_table
-                        .get("action")
-                        .and_then(Item::as_str)
-                        .and_then(|s| match s {
-                            "allow" => Some(rules::RuleAction::Allow),
-                            "deny" => Some(rules::RuleAction::Deny),
-                            _ => None,
-                        })?;
-
-                    Some(rules::Rule {
-                        cidr,
-                        client_random_prefix,
-                        action,
-                    })
-                })
-                .collect();
-
-            rules::RulesConfig { rule: rules }
-        }
-        None => {
-            // No rules array found, create empty config
-            rules::RulesConfig { rule: vec![] }
-        }
-    };
+    let path = deserialize_file_path(deserializer)?;
+    let content = std::fs::read_to_string(&path).map_err(|e| {
+        serde::de::Error::custom(format!(
+            "Couldn't read rules file: path={} error={}",
+            path, e
+        ))
+    })?;
+    let rules_config = parse_rules(&content).map_err(|e| {
+        serde::de::Error::custom(format!("Invalid rules file: path={} error={}", path, e))
+    })?;
 
     Ok(Some(rules::RulesEngine::from_config(rules_config)))
+}
+
+fn parse_rules(content: &str) -> Result<rules::RulesConfig, String> {
+    let document: Document = content
+        .parse()
+        .map_err(|e| format!("Couldn't parse TOML: {}", e))?;
+    let rule_tables = document
+        .get("rule")
+        .and_then(Item::as_array_of_tables)
+        .ok_or_else(|| "Expected an array of tables named 'rule'".to_string())?;
+
+    let rule = rule_tables
+        .iter()
+        .enumerate()
+        .map(|(index, table)| {
+            for (name, _) in table.iter() {
+                if !matches!(name, "cidr" | "client_random_prefix" | "action") {
+                    return Err(format!("Rule #{}: unknown field '{}'", index + 1, name));
+                }
+            }
+
+            let string_field = |name: &str| -> Result<Option<String>, String> {
+                table
+                    .get(name)
+                    .map(|item| {
+                        item.as_str().map(str::to_string).ok_or_else(|| {
+                            format!("Rule #{}: '{}' must be a string", index + 1, name)
+                        })
+                    })
+                    .transpose()
+            };
+
+            let cidr = string_field("cidr")?;
+            if let Some(value) = &cidr {
+                value
+                    .parse::<ipnet::IpNet>()
+                    .map_err(|e| format!("Rule #{}: invalid CIDR '{}': {}", index + 1, value, e))?;
+            }
+
+            let client_random_prefix = string_field("client_random_prefix")?;
+            if let Some(value) = &client_random_prefix {
+                validate_client_random_prefix(value)
+                    .map_err(|e| format!("Rule #{}: {}", index + 1, e))?;
+            }
+
+            let action = match string_field("action")?.as_deref() {
+                Some("allow") => rules::RuleAction::Allow,
+                Some("deny") => rules::RuleAction::Deny,
+                Some(value) => {
+                    return Err(format!("Rule #{}: unknown action '{}'", index + 1, value));
+                }
+                None => return Err(format!("Rule #{}: missing action", index + 1)),
+            };
+
+            Ok(rules::Rule {
+                cidr,
+                client_random_prefix,
+                action,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(rules::RulesConfig { rule })
+}
+
+fn validate_client_random_prefix(value: &str) -> Result<(), String> {
+    let mut parts = value.split('/');
+    let prefix = parts.next().unwrap();
+    let mask = parts.next();
+    if parts.next().is_some() {
+        return Err("client_random_prefix must contain at most one '/'".to_string());
+    }
+
+    let prefix = hex::decode(prefix).map_err(|e| format!("invalid client_random_prefix: {}", e))?;
+    if prefix.is_empty() {
+        return Err("client_random_prefix cannot be empty".to_string());
+    }
+
+    if let Some(mask) = mask {
+        let mask =
+            hex::decode(mask).map_err(|e| format!("invalid client_random_prefix mask: {}", e))?;
+        if mask.is_empty() {
+            return Err("client_random_prefix mask cannot be empty".to_string());
+        }
+        if mask.len() != prefix.len() {
+            return Err("client_random_prefix and mask must have equal lengths".to_string());
+        }
+    }
+
+    Ok(())
 }
 
 fn demangle_toml_string(x: String) -> String {
@@ -1700,6 +1733,64 @@ fn demangle_toml_string(x: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rules_file_parses_valid_rules() {
+        let config = parse_rules(
+            r#"
+[[rule]]
+cidr = "192.0.2.0/24"
+client_random_prefix = "a0b0/f0f0"
+action = "allow"
+
+[[rule]]
+action = "deny"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.rule.len(), 2);
+        assert_eq!(config.rule[0].action, rules::RuleAction::Allow);
+        assert_eq!(config.rule[1].action, rules::RuleAction::Deny);
+    }
+
+    #[test]
+    fn rules_file_rejects_fail_open_input() {
+        let invalid = [
+            ("", "Expected an array of tables"),
+            ("rule = []", "Expected an array of tables"),
+            ("[[rule]]\naction = 'denny'", "unknown action"),
+            (
+                "[[rule]]\ncdir = '192.0.2.0/24'\naction = 'deny'",
+                "unknown field",
+            ),
+            (
+                "[[rule]]\ncidr = 123\naction = 'deny'",
+                "'cidr' must be a string",
+            ),
+            (
+                "[[rule]]\ncidr = 'invalid'\naction = 'deny'",
+                "invalid CIDR",
+            ),
+            (
+                "[[rule]]\nclient_random_prefix = 'aa/'\naction = 'deny'",
+                "mask cannot be empty",
+            ),
+            (
+                "[[rule]]\nclient_random_prefix = 'aa/ffff'\naction = 'deny'",
+                "equal lengths",
+            ),
+            ("[[rule]]\ncidr = '192.0.2.0/24'", "missing action"),
+        ];
+
+        for (content, expected) in invalid {
+            let error = parse_rules(content).unwrap_err();
+            assert!(
+                error.contains(expected),
+                "expected error containing '{expected}', got '{error}'"
+            );
+        }
+    }
 
     #[test]
     fn default_auth_failure_status_code_is_407() {
