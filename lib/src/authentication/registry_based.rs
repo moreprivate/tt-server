@@ -58,3 +58,20 @@ impl Authenticator for RegistryBasedAuthenticator {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_registry_rejects_all_credentials() {
+        let authenticator = RegistryBasedAuthenticator::new(&[]);
+        let source = authentication::Source::ProxyBasic("anything".into());
+        let id = log_utils::IdChain::<u64>::empty();
+
+        assert!(matches!(
+            authenticator.authenticate(&source, &id),
+            authentication::Status::Reject
+        ));
+    }
+}
