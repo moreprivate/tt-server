@@ -20,6 +20,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- [Security] Start public endpoints with empty credentials in deny-all mode instead of rejecting the configuration.
 - [Security] Fail endpoint startup when a configured connection-rules file or any rule is invalid instead of silently allowing connections.
 
 ## [1.0.41] - 2026-04-30

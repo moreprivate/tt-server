@@ -105,6 +105,11 @@ impl Core {
         tls_hosts_settings: settings::TlsHostsSettings,
         shutdown: Arc<Mutex<Shutdown>>,
     ) -> Result<Self, Error> {
+        if !settings.listen_address.ip().is_loopback() && authenticator.is_none() {
+            return Err(Error::SettingsValidation(
+                settings::ValidationError::NoAuthenticatorOnPublicAddress,
+            ));
+        }
         if !settings.is_built() {
             settings.validate().map_err(Error::SettingsValidation)?;
         }
@@ -767,6 +772,30 @@ impl Core {
             ForwardProtocolSettings::Direct(_) => Box::new(DirectForwarder::new(context)),
             ForwardProtocolSettings::Socks5(_) => Box::new(Socks5Forwarder::new(context)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn public_listener_requires_an_authenticator() {
+        let mut settings = Settings::default();
+        settings.listen_address = "0.0.0.0:443".parse().unwrap();
+
+        let result = Core::new(
+            settings,
+            None,
+            settings::TlsHostsSettings::default(),
+            Shutdown::new(),
+        );
+        assert!(matches!(
+            result,
+            Err(Error::SettingsValidation(
+                settings::ValidationError::NoAuthenticatorOnPublicAddress
+            ))
+        ));
     }
 }
 

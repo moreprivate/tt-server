@@ -280,7 +280,9 @@ pub async fn run_endpoint(listen_address: &SocketAddr) {
 
 pub async fn run_endpoint_with_settings(settings: Settings, hosts_settings: TlsHostsSettings) {
     let shutdown = Shutdown::new();
-    let authenticator: Option<Arc<dyn Authenticator>> = if !settings.get_clients().is_empty() {
+    let authenticator: Option<Arc<dyn Authenticator>> = if !settings.get_clients().is_empty()
+        || !settings.get_listen_address().ip().is_loopback()
+    {
         Some(Arc::new(RegistryBasedAuthenticator::new(
             settings.get_clients(),
         )))

@@ -238,7 +238,7 @@ fn main() {
 
     if settings.get_clients().is_empty() && settings.get_listen_address().ip().is_loopback() {
         warn!(
-            "No credentials configured (credentials_file is missing). \
+            "No credentials configured. \
             Anyone can connect to this endpoint. This is acceptable for local development \
             but should not be used in production."
         );
@@ -496,7 +496,9 @@ fn main() {
     };
 
     let shutdown = Shutdown::new();
-    let authenticator: Option<Arc<dyn Authenticator>> = if !settings.get_clients().is_empty() {
+    let authenticator: Option<Arc<dyn Authenticator>> = if !settings.get_clients().is_empty()
+        || !settings.get_listen_address().ip().is_loopback()
+    {
         Some(Arc::new(RegistryBasedAuthenticator::new(
             settings.get_clients(),
         )))

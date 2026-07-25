@@ -31,8 +31,8 @@ pub enum ValidationError {
     InvalidPath(String),
     /// Invalid rules file
     RulesFile(String),
-    /// No credentials configured while listening on a public address
-    NoCredentialsOnPublicAddress,
+    /// No authenticator configured while listening on a public address
+    NoAuthenticatorOnPublicAddress,
     /// Invalid auth failure status code
     InvalidAuthFailureStatusCode(u16),
 }
@@ -48,10 +48,10 @@ impl Debug for ValidationError {
             Self::ListenProtocols(x) => write!(f, "Invalid listen protocols settings: {}", x),
             Self::InvalidPath(x) => write!(f, "Invalid request path: {}", x),
             Self::RulesFile(x) => write!(f, "Invalid rules file: {}", x),
-            Self::NoCredentialsOnPublicAddress => write!(
+            Self::NoAuthenticatorOnPublicAddress => write!(
                 f,
-                "No credentials configured (credentials_file is missing) while listening on a public address. \
-                This is a security risk. Either configure credentials or use a loopback address (127.0.0.1 or ::1)"
+                "No authenticator configured while listening on a public address. \
+                Configure an authenticator or use a loopback address (127.0.0.1 or ::1)"
             ),
             Self::InvalidAuthFailureStatusCode(code) => write!(
                 f,
@@ -542,11 +542,6 @@ impl Settings {
             && self.listen_protocols.quic.is_none()
         {
             return Err(ValidationError::ListenProtocols("Not set".into()));
-        }
-
-        // Do not start the endpoint without credentials on a public address
-        if self.clients.is_empty() && !self.listen_address.ip().is_loopback() {
-            return Err(ValidationError::NoCredentialsOnPublicAddress);
         }
 
         if !Self::is_valid_auth_failure_status_code(self.auth_failure_status_code) {
@@ -1561,23 +1556,27 @@ where
         )
     })?;
 
-    let clients: Document = content.parse().map_err(|e| {
+    parse_clients(&content).map_err(|e| {
         serde::de::Error::invalid_value(
-            serde::de::Unexpected::Other(&format!(
-                "Couldn't parse file: path={} error={}",
-                path, e
-            )),
-            &"A TOML-formatted file",
+            serde::de::Unexpected::Other(&format!("path={} error={}", path, e)),
+            &"A TOML-formatted array of clients",
         )
-    })?;
+    })
+}
 
-    let res: Vec<Client> = clients
-        .get("client")
-        .and_then(Item::as_array_of_tables)
-        .ok_or(serde::de::Error::invalid_value(
-            serde::de::Unexpected::Other("Not an array of clients"),
-            &"An array of clients",
-        ))?
+fn parse_clients(content: &str) -> Result<Vec<Client>, String> {
+    let document: Document = content
+        .parse()
+        .map_err(|e| format!("Couldn't parse TOML: {}", e))?;
+    let client_tables = match document.get("client") {
+        Some(item) => item
+            .as_array_of_tables()
+            .ok_or_else(|| "'client' must be an array of tables".to_string())?,
+        None if document.as_table().is_empty() => return Ok(Vec::new()),
+        None => return Err("Expected an array of tables named 'client'".to_string()),
+    };
+
+    client_tables
         .iter()
         .enumerate()
         .map(|(idx, x)| {
@@ -1585,16 +1584,10 @@ where
             let password = demangle_toml_string(x["password"].to_string());
 
             if username.is_empty() {
-                return Err(serde::de::Error::custom(format!(
-                    "Client #{}: username cannot be empty",
-                    idx + 1
-                )));
+                return Err(format!("Client #{}: username cannot be empty", idx + 1));
             }
             if password.is_empty() {
-                return Err(serde::de::Error::custom(format!(
-                    "Client #{}: password cannot be empty",
-                    idx + 1
-                )));
+                return Err(format!("Client #{}: password cannot be empty", idx + 1));
             }
 
             let max_http2_conns = x
@@ -1613,9 +1606,7 @@ where
                 max_http3_conns,
             })
         })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    Ok(res)
+        .collect()
 }
 
 fn deserialize_rules<'de, D>(deserializer: D) -> Result<Option<rules::RulesEngine>, D::Error>
@@ -1733,6 +1724,21 @@ fn demangle_toml_string(x: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_credentials_are_valid_and_deny_all_can_be_configured() {
+        assert!(parse_clients("").unwrap().is_empty());
+        assert!(parse_clients("# no clients configured yet\n")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn malformed_nonempty_credentials_are_rejected() {
+        for content in ["clients = []", "[client]\nusername = 'a'\npassword = 'b'"] {
+            assert!(parse_clients(content).is_err(), "{content}");
+        }
+    }
 
     #[test]
     fn rules_file_parses_valid_rules() {
