@@ -14,7 +14,12 @@ use trusttunnel::settings::Settings;
 use trusttunnel::shutdown::Shutdown;
 use trusttunnel::{log_utils, settings};
 
-const VERSION_STRING: &str = env!("CARGO_PKG_VERSION");
+// CI supplies the immutable artifact tag; local builds fall back to Cargo's
+// product version. Installers intentionally verify this exact identity.
+const VERSION_STRING: &str = match option_env!("TT_ENDPOINT_VERSION") {
+    Some(version) => version,
+    None => env!("CARGO_PKG_VERSION"),
+};
 const VERSION_PARAM_NAME: &str = "v_e_r_s_i_o_n_do_not_change_this_name_it_will_break";
 const LOG_LEVEL_PARAM_NAME: &str = "log_level";
 const LOG_FILE_PARAM_NAME: &str = "log_file";

@@ -1,0 +1,343 @@
+name: Build server targets
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_runner:
+        description: Runner for validation and build jobs
+        required: true
+        default: self-hosted
+        type: choice
+        options:
+          - self-hosted
+          - github-hosted
+      delete_existing:
+        description: Delete an existing release/tag with the same source version
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-update-server
+  cancel-in-progress: false
+
+jobs:
+  source:
+    name: Resolve patch source
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    outputs:
+      source_sha: ${{ steps.result.outputs.source_sha }}
+      short_sha: ${{ steps.result.outputs.short_sha }}
+      release_tag: ${{ steps.result.outputs.release_tag }}
+
+    steps:
+      - name: Check out patch branch
+        uses: actions/checkout@v6
+        with:
+          ref: privacy/server-hardening
+          fetch-depth: 0
+
+      - name: Resolve source commit
+        id: result
+        shell: bash
+        run: |
+          set -euo pipefail
+          SOURCE_SHA="$(git rev-list -1 HEAD -- . ':(exclude).github/**')"
+          test -n "${SOURCE_SHA}"
+          SHORT_SHA="$(git rev-parse --short=12 "${SOURCE_SHA}")"
+          COMMIT_EPOCH="$(git show -s --format=%ct "${SOURCE_SHA}")"
+          COMMIT_STAMP="$(date -u --date="@${COMMIT_EPOCH}" +%Y%m%dT%H%M%SZ)"
+          RELEASE_TAG="${COMMIT_STAMP}-${SHORT_SHA}"
+          echo "source_sha=${SOURCE_SHA}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "release_tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+
+  validate:
+    name: Validate server
+    needs: source
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.build_runner == 'self-hosted' && 'docker-runner' || 'ubuntu-24.04' }}
+    timeout-minutes: 360
+    container:
+      image: adguard/core-libs:2.12
+    env:
+      # Keep cargo, cargo-zigbuild, and boring-sys on the image's native
+      # /opt/cargo path.  Mixing this with a different CARGO_HOME makes the
+      # generated CMake toolchain point at a registry path that does not exist.
+      CARGO_HOME: /opt/cargo
+
+    steps:
+      - name: Check out source ref
+        uses: actions/checkout@v6
+        with:
+          ref: privacy/server-hardening
+          fetch-depth: 0
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v5
+        with:
+          path: |
+            /opt/cargo/registry/index/
+            /opt/cargo/registry/cache/
+            /opt/cargo/git/db/
+          key: cargo-v1-${{ hashFiles('Cargo.lock') }}
+
+      - name: Run server checks
+        shell: bash
+        run: |
+          rustup component add rustfmt clippy
+          cargo fmt --all -- --check
+          cargo test --workspace --locked
+          cargo clippy --locked -- -D warnings
+          cargo test --locked -p trusttunnel rules::tests -- --nocapture
+
+  build:
+    name: Build server targets
+    needs:
+      - source
+      - validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-linux-musl
+            zig_target: x86_64-linux-musl
+          - arch: aarch64
+            target: aarch64-unknown-linux-musl
+            zig_target: aarch64-linux-musl
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.build_runner == 'self-hosted' && 'docker-runner' || 'ubuntu-24.04' }}
+    timeout-minutes: 360
+    container:
+      image: adguard/core-libs:2.12
+    env:
+      CARGO_HOME: /opt/cargo
+
+    steps:
+      - name: Check out source ref
+        uses: actions/checkout@v6
+        with:
+          ref: privacy/server-hardening
+          fetch-depth: 0
+
+      - name: Cache Cargo dependencies and Zig adapter
+        uses: actions/cache@v5
+        with:
+          path: |
+            /opt/cargo/bin/cargo-zigbuild
+            /opt/cargo/registry/index/
+            /opt/cargo/registry/cache/
+            /opt/cargo/git/db/
+          key: cargo-zigbuild-0.22.3-v1-${{ hashFiles('Cargo.lock') }}
+
+      - name: Configure Zig build
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          ZIG_TARGET: ${{ matrix.zig_target }}
+        run: |
+          echo /opt/cargo/bin >> "$GITHUB_PATH"
+          rustup target add "${TARGET}"
+          if ! command -v cargo-zigbuild >/dev/null 2>&1; then
+            cargo install --locked --version 0.22.3 cargo-zigbuild
+          fi
+          zig version
+          cat > "${RUNNER_TEMP}/zig-compiler" <<EOF
+          #!/usr/bin/env bash
+          set -euo pipefail
+          mode=cc
+          case "\${0##*/}" in
+            zig-cxx) mode=c++ ;;
+          esac
+          args=()
+          skip_target_value=0
+          for arg in "\$@"; do
+            if [[ "\${skip_target_value}" == 1 ]]; then
+              skip_target_value=0
+              continue
+            fi
+            case "\${arg}" in
+              --target=*|-target=*) continue ;;
+              --target|-target) skip_target_value=1; continue ;;
+            esac
+            args+=("\${arg}")
+          done
+          exec zig "\${mode}" -target "${ZIG_TARGET}" "\${args[@]}"
+          EOF
+          chmod 755 "${RUNNER_TEMP}/zig-compiler"
+          ln -sf zig-compiler "${RUNNER_TEMP}/zig-cc"
+          ln -sf zig-compiler "${RUNNER_TEMP}/zig-cxx"
+          {
+            echo "CC=${RUNNER_TEMP}/zig-cc"
+            echo "CXX=${RUNNER_TEMP}/zig-cxx"
+          } >> "${GITHUB_ENV}"
+
+      - name: Build server binary
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          TT_ENDPOINT_VERSION: ${{ needs.source.outputs.release_tag }}
+        run: |
+          cargo zigbuild \
+            --release \
+            --locked \
+            --target "${TARGET}" \
+            --bin trusttunnel_endpoint
+
+      - name: Prepare artifact
+        shell: bash
+        env:
+          ARCH: ${{ matrix.arch }}
+          TARGET: ${{ matrix.target }}
+          RELEASE_TAG: ${{ needs.source.outputs.release_tag }}
+          SOURCE_SHA: ${{ needs.source.outputs.source_sha }}
+        run: |
+          mkdir -p "artifacts/${ARCH}"
+          llvm-strip \
+            -o "artifacts/${ARCH}/tt-server-${RELEASE_TAG}-linux-${ARCH}" \
+            "target/${TARGET}/release/trusttunnel_endpoint"
+          BINARY="artifacts/${ARCH}/tt-server-${RELEASE_TAG}-linux-${ARCH}"
+          chmod 755 "${BINARY}"
+          case "${ARCH}" in
+            x86_64)
+              llvm-readelf -h "${BINARY}" | grep -Fq 'X86-64'
+              ;;
+            aarch64)
+              llvm-readelf -h "${BINARY}" | grep -Fq 'AArch64'
+              ;;
+            *)
+              echo "Unsupported artifact architecture: ${ARCH}" >&2
+              exit 1
+              ;;
+          esac
+          (
+            cd "artifacts/${ARCH}"
+            sha256sum "tt-server-${RELEASE_TAG}-linux-${ARCH}" \
+              > "tt-server-${RELEASE_TAG}-linux-${ARCH}.sha256"
+          )
+          printf '%s\n' "${SOURCE_SHA}" > "artifacts/${ARCH}/SOURCE_COMMIT-${ARCH}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: tt-server-${{ matrix.arch }}-${{ needs.source.outputs.short_sha }}
+          path: artifacts/${{ matrix.arch }}/
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Create release
+    needs:
+      - source
+      - build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out released source
+        uses: actions/checkout@v6
+        with:
+          ref: privacy/server-hardening
+          fetch-depth: 0
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: tt-server-*
+          path: release
+          merge-multiple: true
+
+      - name: Create immutable release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.source.outputs.release_tag }}
+          SOURCE_REPO: ${{ github.repository }}
+          DELETE_EXISTING: ${{ inputs.delete_existing || false }}
+        run: |
+          set -euo pipefail
+          case "${RELEASE_TAG}" in
+            *[!A-Za-z0-9._-]*|'')
+              echo "Invalid release tag: ${RELEASE_TAG}" >&2
+              exit 1
+              ;;
+          esac
+          release_exists=0
+          tag_exists=0
+          gh release view "${RELEASE_TAG}" >/dev/null 2>&1 && release_exists=1 || true
+          gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" >/dev/null 2>&1 && tag_exists=1 || true
+          if [[ "${DELETE_EXISTING}" == true ]]; then
+            if (( release_exists )); then
+              gh release delete "${RELEASE_TAG}" --yes --cleanup-tag
+              release_exists=0
+              tag_exists=0
+            elif (( tag_exists )); then
+              gh api --method DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${RELEASE_TAG}"
+              tag_exists=0
+            fi
+          elif (( release_exists || tag_exists )); then
+            echo "Release/tag already exists: ${RELEASE_TAG}; pass delete_existing=true to replace it" >&2
+            exit 1
+          fi
+
+          SOURCE_SHA="$(git rev-parse HEAD)"
+          (
+            cd release
+            find . -maxdepth 1 -type f \
+              -name "tt-server-${RELEASE_TAG}-linux-*" \
+              ! -name '*.sha256' -printf '%f\n' \
+              | sort \
+              | xargs sha256sum > SHA256SUMS
+          )
+          SOURCE_REPO="${SOURCE_REPO}" SOURCE_SHA="${SOURCE_SHA}" RELEASE_TAG="${RELEASE_TAG}" \
+            python3 - <<'PY'
+          import glob
+          import hashlib
+          import json
+          import os
+
+          assets = []
+          for path in sorted(glob.glob("release/tt-server-*-linux-*")):
+              if path.endswith(".sha256"):
+                  continue
+              with open(path, "rb") as stream:
+                  digest = hashlib.file_digest(stream, "sha256").hexdigest()
+              assets.append({
+                  "name": os.path.basename(path),
+                  "sha256": digest,
+                  "size": os.path.getsize(path),
+              })
+
+          manifest = {
+              "schema": 1,
+              "component": "tt-server",
+              "release_tag": os.environ["RELEASE_TAG"],
+              "source_repository": os.environ["SOURCE_REPO"],
+              "source_commit": os.environ["SOURCE_SHA"],
+              "assets": assets,
+          }
+          with open("release/manifest.json", "w", encoding="utf-8") as stream:
+              json.dump(manifest, stream, indent=2)
+              stream.write("\n")
+          PY
+
+          mapfile -t RELEASE_ASSETS < <(
+            find release -maxdepth 1 -type f \
+              \( \
+                -name "tt-server-${RELEASE_TAG}-linux-*" \
+                ! -name '*.sha256' \
+                -o -name "tt-server-${RELEASE_TAG}-linux-*.sha256" \
+              \) \
+              | sort
+          )
+          RELEASE_ASSETS+=(release/SHA256SUMS release/manifest.json)
+          gh release create "${RELEASE_TAG}" \
+            --target "${GITHUB_SHA}" \
+            --title "${RELEASE_TAG}" \
+            --notes "Server binary built from validated ${SOURCE_REPO}@${SOURCE_SHA}." \
+            "${RELEASE_ASSETS[@]}"
