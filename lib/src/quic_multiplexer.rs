@@ -814,12 +814,7 @@ impl QuicSocket {
         }
 
         h3_conn
-            .send_response(
-                &mut quic_conn,
-                stream_id,
-                response.as_slice(),
-                fin,
-            )
+            .send_response(&mut quic_conn, stream_id, response.as_slice(), fin)
             .map_err(|e| {
                 let kind = if matches!(e, h3::Error::StreamBlocked) {
                     ErrorKind::WouldBlock
@@ -914,8 +909,7 @@ impl QuicSocket {
         };
 
         let want = data.len();
-        let action = match h3_conn.send_body(&mut quic_conn, stream_id, &data[..send_len], false)
-        {
+        let action = match h3_conn.send_body(&mut quic_conn, stream_id, &data[..send_len], false) {
             Ok(n) => {
                 if n < want {
                     log_id!(
@@ -1017,11 +1011,9 @@ impl QuicSocket {
                 ErrorKind::BrokenPipe,
                 format!("H3 stream {stream_id} write retired"),
             )),
-            Some(crate::h3_stream_write_policy::BodyWriteErrorAction::Fatal) => {
-                Err(io::Error::other(format!(
-                    "H3 stream {stream_id} write fatal error"
-                )))
-            }
+            Some(crate::h3_stream_write_policy::BodyWriteErrorAction::Fatal) => Err(
+                io::Error::other(format!("H3 stream {stream_id} write fatal error")),
+            ),
         }
     }
 

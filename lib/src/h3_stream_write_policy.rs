@@ -77,11 +77,7 @@ pub fn classify_body_write_error(
 }
 
 /// Whether a refuse-closed body write is a permanent hard error for upper layers.
-pub fn refuse_closed_is_hard_error(
-    fin_pending: bool,
-    fin_done: bool,
-    peer_stopped: bool,
-) -> bool {
+pub fn refuse_closed_is_hard_error(fin_pending: bool, fin_done: bool, peer_stopped: bool) -> bool {
     // All refuse cases are permanent for this stream write side (FIN in flight means
     // no more body; done/stopped means closed).
     matches!(
