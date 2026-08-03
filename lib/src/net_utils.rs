@@ -105,43 +105,6 @@ pub(crate) const fn http3_data_frame_overhead(payload_size: usize) -> usize {
     HTTP3_DATA_FRAME_TYPE_WIRE_LENGTH + varint_len(payload_size)
 }
 
-/// HTTP/3 DATA frame type (RFC 9114 §7.2.1).
-pub(crate) const HTTP3_DATA_FRAME_TYPE: u64 = 0x00;
-
-/// Encode a QUIC variable-length integer (RFC 9000 §16).
-pub(crate) fn encode_quic_varint(value: u64, out: &mut Vec<u8>) {
-    if value <= 63 {
-        out.push(value as u8);
-    } else if value <= 16_383 {
-        out.push(0x40 | ((value >> 8) as u8));
-        out.push(value as u8);
-    } else if value <= 1_073_741_823 {
-        out.push(0x80 | ((value >> 24) as u8));
-        out.push((value >> 16) as u8);
-        out.push((value >> 8) as u8);
-        out.push(value as u8);
-    } else {
-        assert!(value <= 4_611_686_018_427_387_903);
-        out.push(0xc0 | ((value >> 56) as u8));
-        out.push((value >> 48) as u8);
-        out.push((value >> 40) as u8);
-        out.push((value >> 32) as u8);
-        out.push((value >> 24) as u8);
-        out.push((value >> 16) as u8);
-        out.push((value >> 8) as u8);
-        out.push(value as u8);
-    }
-}
-
-/// Build one complete HTTP/3 DATA frame (type + length + payload).
-pub(crate) fn encode_h3_data_frame(payload: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(http3_data_frame_overhead(payload.len()) + payload.len());
-    encode_quic_varint(HTTP3_DATA_FRAME_TYPE, &mut out);
-    encode_quic_varint(payload.len() as u64, &mut out);
-    out.extend_from_slice(payload);
-    out
-}
-
 /// Largest DATA payload that fits in `stream_capacity` bytes (including frame header).
 pub(crate) fn max_h3_data_payload_for_capacity(cap: usize) -> usize {
     if cap < MIN_USABLE_QUIC_STREAM_CAPACITY {
@@ -163,15 +126,6 @@ pub(crate) fn max_h3_data_payload_for_capacity(cap: usize) -> usize {
 #[cfg(test)]
 mod h3_frame_tests {
     use super::*;
-
-    #[test]
-    fn data_frame_roundtrip_sizes() {
-        for n in [0usize, 1, 62, 63, 64, 1000, 16383, 16384] {
-            let payload = vec![0xab; n];
-            let frame = encode_h3_data_frame(&payload);
-            assert_eq!(frame.len(), http3_data_frame_overhead(n) + n);
-        }
-    }
 
     #[test]
     fn max_payload_fits_capacity() {
