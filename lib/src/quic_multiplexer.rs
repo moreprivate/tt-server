@@ -829,12 +829,12 @@ impl QuicSocket {
                 };
                 io::Error::new(kind, e.to_string())
             })?;
-        drop(quic_conn);
-        drop(h3_conn);
-
+        // Mark under H3+QUIC locks so body cannot race past headers+FIN.
         if fin {
             self.mark_write_fin_done(stream_id);
         }
+        drop(quic_conn);
+        drop(h3_conn);
 
         self.flush_pending_data()
     }
@@ -893,6 +893,8 @@ impl QuicSocket {
         }
 
         let want = data.len();
+        // Retire write side *under* H3+QUIC locks so concurrent body/FIN cannot race
+        // past STOP_SENDING / already-closed stream (peer FINAL_SIZE_ERROR under multi).
         let action = match h3_conn.send_body(&mut quic_conn, stream_id, data.as_ref(), false) {
             Ok(n) => {
                 if n < want {
@@ -914,10 +916,11 @@ impl QuicSocket {
                 ))
             }
             Err(h3::Error::TransportError(quiche::Error::StreamStopped(app))) => {
+                self.mark_peer_stopped_locked(stream_id);
                 log_id!(
-                    warn,
+                    debug,
                     self.id,
-                    "H3 body write STOP_SENDING stream={} app_error={} — retire stream, no write-FIN",
+                    "H3 body write STOP_SENDING stream={} app_error={} — retired (no RESET)",
                     stream_id,
                     app
                 );
@@ -926,10 +929,11 @@ impl QuicSocket {
                 ))
             }
             Err(h3::Error::TransportError(quiche::Error::FinalSize)) => {
+                self.mark_write_fin_done(stream_id);
                 log_id!(
                     warn,
                     self.id,
-                    "H3 body write FINAL_SIZE stream={} want={} finished={} — peer may close conn with 0x6",
+                    "H3 body write FINAL_SIZE stream={} want={} finished={} — retired write side",
                     stream_id,
                     want,
                     quic_conn.stream_finished(stream_id)
@@ -939,10 +943,12 @@ impl QuicSocket {
                 ))
             }
             Err(h3::Error::TransportError(quiche::Error::InvalidStreamState(s))) => {
+                // Residual body after peer cancel / local FIN — expected at download end.
+                self.mark_write_fin_done(stream_id);
                 log_id!(
-                    warn,
+                    debug,
                     self.id,
-                    "H3 body write InvalidStreamState stream={} state_id={} want={}",
+                    "H3 body write InvalidStreamState stream={} state_id={} want={} — retired",
                     stream_id,
                     s,
                     want
@@ -952,8 +958,9 @@ impl QuicSocket {
                 ))
             }
             Err(h3::Error::FrameUnexpected) => {
+                self.mark_write_fin_done(stream_id);
                 log_id!(
-                    info,
+                    debug,
                     self.id,
                     "H3 body write FrameUnexpected stream={} want={} (local send already finished)",
                     stream_id,
@@ -985,16 +992,9 @@ impl QuicSocket {
                 self.flush_pending_data().map(|_| data)
             }
             Some(crate::h3_stream_write_policy::BodyWriteErrorAction::RetireNoFurtherFin {
-                peer_stop_sending,
+                ..
             }) => {
-                if peer_stop_sending {
-                    self.mark_peer_stopped(stream_id);
-                } else {
-                    // InvalidStreamState / FinalSize / FrameUnexpected: stream already
-                    // closed or poisoned — only mark done. Do NOT RESET (RESET after FIN
-                    // caused peer FINAL_SIZE_ERROR under multi speedtest).
-                    self.mark_write_fin_done(stream_id);
-                }
+                // Retirement flags already set under H3+QUIC locks above.
                 Err(io::Error::new(
                     ErrorKind::BrokenPipe,
                     format!("H3 stream {stream_id} write retired"),
@@ -1064,54 +1064,13 @@ impl QuicSocket {
         self.write_fin_done.lock().unwrap().insert(stream_id);
     }
 
-    /// After peer STOP_SENDING: retire write side. Only RESET if we never successfully
-    /// H3-FIN'd and no FIN is in flight — RESET after local FIN (or while FIN is pending)
-    /// is a known FINAL_SIZE_ERROR trigger at multi download end.
-    fn mark_peer_stopped(&self, stream_id: u64) {
+    /// Retire write side after peer STOP_SENDING. Call only while holding H3+QUIC locks
+    /// (or with no concurrent writers). **Never** RESET_STREAM here: RESET after bulk
+    /// DATA / FIN races produced peer FINAL_SIZE_ERROR (0x6) at multi download end.
+    /// Peer already stopped reading; we only refuse further local body/FIN.
+    fn mark_peer_stopped_locked(&self, stream_id: u64) {
         self.peer_stopped.lock().unwrap().insert(stream_id);
-        let already_finned = self.write_fin_done.lock().unwrap().contains(&stream_id);
-        let fin_pending = self.pending_write_fin.lock().unwrap().contains(&stream_id);
         self.mark_write_fin_done(stream_id);
-        if already_finned || fin_pending {
-            log_id!(
-                debug,
-                self.id,
-                "STOP_SENDING stream={} after local FIN/pending — no RESET (avoids final-size clash)",
-                stream_id
-            );
-            return;
-        }
-        // Never sent FIN: discard unsent with RESET_STREAM (H3_NO_ERROR = 0x100).
-        // Skip if quiche already considers the send side finished (FIN on wire).
-        let mut quic_conn = self.quic_conn.lock().unwrap();
-        if quic_conn.stream_finished(stream_id) {
-            log_id!(
-                debug,
-                self.id,
-                "STOP_SENDING stream={} quiche already finished — no RESET",
-                stream_id
-            );
-            return;
-        }
-        match quic_conn.stream_shutdown(stream_id, quiche::Shutdown::Write, 0x100) {
-            Ok(()) | Err(quiche::Error::Done) | Err(quiche::Error::InvalidStreamState(_)) => {
-                log_id!(
-                    debug,
-                    self.id,
-                    "STOP_SENDING stream={} — RESET write (no prior FIN)",
-                    stream_id
-                );
-            }
-            Err(e) => {
-                log_id!(
-                    debug,
-                    self.id,
-                    "STOP_SENDING stream={} stream_shutdown: {}",
-                    stream_id,
-                    e
-                );
-            }
-        }
     }
 
     fn try_h3_write_fin(&self, stream_id: u64) {
@@ -1131,8 +1090,8 @@ impl QuicSocket {
         let finished = quic_conn.stream_finished(stream_id);
         match h3_conn.send_body(&mut quic_conn, stream_id, &[], true) {
             Ok(_) => {
-                drop(quic_conn);
-                drop(h3_conn);
+                // Must mark before releasing H3+QUIC locks — otherwise concurrent body
+                // write can pass the gate and append DATA after FIN (peer 0x6).
                 self.mark_write_fin_done(stream_id);
                 log_id!(
                     debug,
@@ -1143,8 +1102,6 @@ impl QuicSocket {
                 );
             }
             Err(h3::Error::FrameUnexpected) => {
-                drop(quic_conn);
-                drop(h3_conn);
                 self.mark_write_fin_done(stream_id);
                 log_id!(
                     debug,
@@ -1165,20 +1122,16 @@ impl QuicSocket {
                 );
             }
             Err(h3::Error::TransportError(quiche::Error::StreamStopped(app))) => {
-                drop(quic_conn);
-                drop(h3_conn);
-                self.mark_peer_stopped(stream_id);
+                self.mark_peer_stopped_locked(stream_id);
                 log_id!(
-                    warn,
+                    debug,
                     self.id,
-                    "H3 write FIN hit STOP_SENDING stream={} app_error={} — RESET write, no empty FIN",
+                    "H3 write FIN hit STOP_SENDING stream={} app_error={} — retired (no RESET, no empty FIN)",
                     stream_id,
                     app
                 );
             }
             Err(h3::Error::TransportError(quiche::Error::FinalSize)) => {
-                drop(quic_conn);
-                drop(h3_conn);
                 // Local stack already has a final size; do not RESET (worsens peer 0x6).
                 self.mark_write_fin_done(stream_id);
                 log_id!(
@@ -1190,8 +1143,6 @@ impl QuicSocket {
                 );
             }
             Err(h3::Error::TransportError(quiche::Error::InvalidStreamState(s))) => {
-                drop(quic_conn);
-                drop(h3_conn);
                 self.mark_write_fin_done(stream_id);
                 log_id!(
                     debug,
@@ -1202,8 +1153,6 @@ impl QuicSocket {
                 );
             }
             Err(h3::Error::TransportError(quiche::Error::Done)) => {
-                drop(quic_conn);
-                drop(h3_conn);
                 self.mark_write_fin_done(stream_id);
                 log_id!(
                     debug,
