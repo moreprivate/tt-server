@@ -990,9 +990,10 @@ impl QuicSocket {
                 if peer_stop_sending {
                     self.mark_peer_stopped(stream_id);
                 } else {
-                    // InvalidStreamState / FinalSize / FrameUnexpected: do not empty-FIN;
-                    // RESET any residual send buffer so offsets cannot disagree.
-                    self.abandon_local_write(stream_id, 0x100);
+                    // InvalidStreamState / FinalSize / FrameUnexpected: stream already
+                    // closed or poisoned — only mark done. Do NOT RESET (RESET after FIN
+                    // caused peer FINAL_SIZE_ERROR under multi speedtest).
+                    self.mark_write_fin_done(stream_id);
                 }
                 Err(io::Error::new(
                     ErrorKind::BrokenPipe,
@@ -1039,11 +1040,13 @@ impl QuicSocket {
             .insert(stream_id);
     }
 
-    /// Drop per-stream FIN/STOP bookkeeping (long-lived connections open many streams).
+    /// Drop transient per-stream bookkeeping when the codec retires a stream.
+    ///
+    /// **Keep** `write_fin_done` / `peer_stopped`: QUIC stream IDs are never reused on a
+    /// connection. Clearing those at end-of-download (mass close) raced residual body/FIN
+    /// paths and produced peer `FINAL_SIZE_ERROR`. Cleared only on connection teardown.
     pub fn forget_stream(&self, stream_id: u64) {
         self.pending_write_fin.lock().unwrap().remove(&stream_id);
-        self.write_fin_done.lock().unwrap().remove(&stream_id);
-        self.peer_stopped.lock().unwrap().remove(&stream_id);
         self.waiting_writable_streams
             .lock()
             .unwrap()
@@ -1061,30 +1064,54 @@ impl QuicSocket {
         self.write_fin_done.lock().unwrap().insert(stream_id);
     }
 
-    /// Stop local send without H3 empty-FIN: discard unsent bytes and emit RESET_STREAM.
-    /// Used after peer STOP_SENDING / dead stream so we never send a FIN that disagrees
-    /// with prior STREAM offsets (FINAL_SIZE_ERROR under multi cancel).
-    fn abandon_local_write(&self, stream_id: u64, app_error: u64) {
+    /// After peer STOP_SENDING: retire write side. Only RESET if we never successfully
+    /// H3-FIN'd and no FIN is in flight — RESET after local FIN (or while FIN is pending)
+    /// is a known FINAL_SIZE_ERROR trigger at multi download end.
+    fn mark_peer_stopped(&self, stream_id: u64) {
+        self.peer_stopped.lock().unwrap().insert(stream_id);
+        let already_finned = self.write_fin_done.lock().unwrap().contains(&stream_id);
+        let fin_pending = self.pending_write_fin.lock().unwrap().contains(&stream_id);
         self.mark_write_fin_done(stream_id);
+        if already_finned || fin_pending {
+            log_id!(
+                debug,
+                self.id,
+                "STOP_SENDING stream={} after local FIN/pending — no RESET (avoids final-size clash)",
+                stream_id
+            );
+            return;
+        }
+        // Never sent FIN: discard unsent with RESET_STREAM (H3_NO_ERROR = 0x100).
+        // Skip if quiche already considers the send side finished (FIN on wire).
         let mut quic_conn = self.quic_conn.lock().unwrap();
-        match quic_conn.stream_shutdown(stream_id, quiche::Shutdown::Write, app_error) {
-            Ok(()) | Err(quiche::Error::Done) | Err(quiche::Error::InvalidStreamState(_)) => {}
+        if quic_conn.stream_finished(stream_id) {
+            log_id!(
+                debug,
+                self.id,
+                "STOP_SENDING stream={} quiche already finished — no RESET",
+                stream_id
+            );
+            return;
+        }
+        match quic_conn.stream_shutdown(stream_id, quiche::Shutdown::Write, 0x100) {
+            Ok(()) | Err(quiche::Error::Done) | Err(quiche::Error::InvalidStreamState(_)) => {
+                log_id!(
+                    debug,
+                    self.id,
+                    "STOP_SENDING stream={} — RESET write (no prior FIN)",
+                    stream_id
+                );
+            }
             Err(e) => {
                 log_id!(
                     debug,
                     self.id,
-                    "abandon_local_write stream_shutdown stream={}: {}",
+                    "STOP_SENDING stream={} stream_shutdown: {}",
                     stream_id,
                     e
                 );
             }
         }
-    }
-
-    fn mark_peer_stopped(&self, stream_id: u64) {
-        self.peer_stopped.lock().unwrap().insert(stream_id);
-        // H3_NO_ERROR = 0x100 (256) — matches client STOP_SENDING app codes in production logs.
-        self.abandon_local_write(stream_id, 0x100);
     }
 
     fn try_h3_write_fin(&self, stream_id: u64) {
@@ -1152,12 +1179,12 @@ impl QuicSocket {
             Err(h3::Error::TransportError(quiche::Error::FinalSize)) => {
                 drop(quic_conn);
                 drop(h3_conn);
-                // Already in a bad final-size state locally; abandon rather than retry FIN.
-                self.abandon_local_write(stream_id, 0x100);
+                // Local stack already has a final size; do not RESET (worsens peer 0x6).
+                self.mark_write_fin_done(stream_id);
                 log_id!(
                     warn,
                     self.id,
-                    "H3 write FIN FINAL_SIZE stream={} was_finished={} — abandoned write (client may still close with 0x6 if frames already on wire)",
+                    "H3 write FIN FINAL_SIZE stream={} was_finished={} — stop write side only",
                     stream_id,
                     finished
                 );
