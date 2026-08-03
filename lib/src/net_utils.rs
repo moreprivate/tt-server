@@ -184,7 +184,10 @@ mod h3_frame_tests {
             // one more byte should not fit (unless varint shrinks — check best-effort)
             if p < usize::MAX / 2 {
                 let bigger = p + 1;
-                assert!(http3_data_frame_overhead(bigger) + bigger > cap || varint_len(bigger) < varint_len(p));
+                assert!(
+                    http3_data_frame_overhead(bigger) + bigger > cap
+                        || varint_len(bigger) < varint_len(p)
+                );
             }
         }
     }
