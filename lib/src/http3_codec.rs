@@ -68,6 +68,8 @@ struct StreamSink {
     /// `StreamBlocked`. Consumed on the first `wait_writable()` cycle.
     /// The second boolean parameter represents EOF.
     pending_response: Option<(ResponseHeaders, bool)>,
+    /// Avoid double write-FIN messages from `eof()` + `Drop`.
+    write_fin_sent: bool,
 }
 
 impl Http3Codec {
@@ -192,6 +194,7 @@ impl Http3Codec {
                 data_frame_overhead: net_utils::MIN_USABLE_QUIC_STREAM_CAPACITY,
                 id,
                 pending_response: None,
+                write_fin_sent: false,
             },
         }))
     }
@@ -404,12 +407,19 @@ impl Drop for StreamSource {
 impl StreamSink {
     fn try_send_pending_response(&mut self) -> io::Result<()> {
         if let Some((ref response, eof)) = self.pending_response {
-            match self.socket.send_response(self.stream_id, response, false) {
+            // When eof=true (headers-only response), pass fin through H3 send_response.
+            // Do NOT send_response(fin=false) then raw write FIN — that is the
+            // FINAL_SIZE-prone path under ngtcp2 clients.
+            match self.socket.send_response(self.stream_id, response, eof) {
                 Ok(()) => {
                     self.pending_response = None;
                     if eof {
+                        // Local send side finished with headers; still drop read if needed.
                         self.codec_tx
-                            .send(StreamMessage::Shutdown(self.stream_id, None))
+                            .send(StreamMessage::Shutdown(
+                                self.stream_id,
+                                Some(quiche::Shutdown::Read),
+                            ))
                             .map_err(|e| {
                                 io::Error::other(format!("Failed to send shutdown message: {}", e))
                             })?;
@@ -516,8 +526,18 @@ impl pipe::Sink for StreamSink {
     }
 
     fn eof(&mut self) -> io::Result<()> {
-        self.socket
-            .shutdown_stream(self.stream_id, quiche::Shutdown::Write);
+        // Must go through codec `on_stream_shutdown` so `write_shutdown` is set.
+        // Only one message: Drop will not send a second write-FIN.
+        if self.write_fin_sent {
+            return Ok(());
+        }
+        self.write_fin_sent = true;
+        self.codec_tx
+            .send(StreamMessage::Shutdown(
+                self.stream_id,
+                Some(quiche::Shutdown::Write),
+            ))
+            .map_err(|e| io::Error::other(format!("Failed to send write-FIN message: {}", e)))?;
         Ok(())
     }
 
@@ -558,6 +578,10 @@ impl http_codec::DroppingSink for StreamSink {
 
 impl Drop for StreamSink {
     fn drop(&mut self) {
+        if self.write_fin_sent {
+            return;
+        }
+        self.write_fin_sent = true;
         match self.codec_tx.send(StreamMessage::Shutdown(
             self.stream_id,
             Some(quiche::Shutdown::Write),
