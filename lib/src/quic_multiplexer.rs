@@ -990,7 +990,9 @@ impl QuicSocket {
                 if peer_stop_sending {
                     self.mark_peer_stopped(stream_id);
                 } else {
-                    self.mark_write_fin_done(stream_id);
+                    // InvalidStreamState / FinalSize / FrameUnexpected: do not empty-FIN;
+                    // RESET any residual send buffer so offsets cannot disagree.
+                    self.abandon_local_write(stream_id, 0x100);
                 }
                 Err(io::Error::new(
                     ErrorKind::BrokenPipe,
@@ -1059,10 +1061,30 @@ impl QuicSocket {
         self.write_fin_done.lock().unwrap().insert(stream_id);
     }
 
+    /// Stop local send without H3 empty-FIN: discard unsent bytes and emit RESET_STREAM.
+    /// Used after peer STOP_SENDING / dead stream so we never send a FIN that disagrees
+    /// with prior STREAM offsets (FINAL_SIZE_ERROR under multi cancel).
+    fn abandon_local_write(&self, stream_id: u64, app_error: u64) {
+        self.mark_write_fin_done(stream_id);
+        let mut quic_conn = self.quic_conn.lock().unwrap();
+        match quic_conn.stream_shutdown(stream_id, quiche::Shutdown::Write, app_error) {
+            Ok(()) | Err(quiche::Error::Done) | Err(quiche::Error::InvalidStreamState(_)) => {}
+            Err(e) => {
+                log_id!(
+                    debug,
+                    self.id,
+                    "abandon_local_write stream_shutdown stream={}: {}",
+                    stream_id,
+                    e
+                );
+            }
+        }
+    }
+
     fn mark_peer_stopped(&self, stream_id: u64) {
         self.peer_stopped.lock().unwrap().insert(stream_id);
-        // Retire write side: no empty write-FIN after STOP_SENDING (FINAL_SIZE poison).
-        self.mark_write_fin_done(stream_id);
+        // H3_NO_ERROR = 0x100 (256) — matches client STOP_SENDING app codes in production logs.
+        self.abandon_local_write(stream_id, 0x100);
     }
 
     fn try_h3_write_fin(&self, stream_id: u64) {
@@ -1122,7 +1144,7 @@ impl QuicSocket {
                 log_id!(
                     warn,
                     self.id,
-                    "H3 write FIN hit STOP_SENDING stream={} app_error={} — no retry FIN",
+                    "H3 write FIN hit STOP_SENDING stream={} app_error={} — RESET write, no empty FIN",
                     stream_id,
                     app
                 );
@@ -1130,11 +1152,12 @@ impl QuicSocket {
             Err(h3::Error::TransportError(quiche::Error::FinalSize)) => {
                 drop(quic_conn);
                 drop(h3_conn);
-                self.mark_write_fin_done(stream_id);
+                // Already in a bad final-size state locally; abandon rather than retry FIN.
+                self.abandon_local_write(stream_id, 0x100);
                 log_id!(
                     warn,
                     self.id,
-                    "H3 write FIN FINAL_SIZE stream={} was_finished={} — double-FIN or size mismatch (client may emit ERR_FINAL_SIZE / conn 0x6)",
+                    "H3 write FIN FINAL_SIZE stream={} was_finished={} — abandoned write (client may still close with 0x6 if frames already on wire)",
                     stream_id,
                     finished
                 );
