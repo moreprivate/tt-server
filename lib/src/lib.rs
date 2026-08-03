@@ -32,6 +32,7 @@ mod http_icmp_codec;
 mod http_ping_handler;
 mod http_speedtest_handler;
 mod http_udp_codec;
+mod h3_stream_write_policy;
 mod icmp_forwarder;
 mod icmp_utils;
 mod metrics;
