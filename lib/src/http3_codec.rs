@@ -126,6 +126,8 @@ impl Http3Codec {
 
         if stream.read_shutdown && stream.write_shutdown {
             self.streams.remove(&stream_id);
+            // Drop per-stream FIN/STOP sets on the socket (long-lived VPN sessions).
+            self.socket.forget_stream(stream_id);
         }
 
         Ok(())
@@ -414,6 +416,8 @@ impl StreamSink {
                 Ok(()) => {
                     self.pending_response = None;
                     if eof {
+                        // Headers carried write-FIN; align sink flag with socket authority.
+                        self.write_fin_sent = true;
                         // Local send side finished with headers; still drop read if needed.
                         self.codec_tx
                             .send(StreamMessage::Shutdown(
@@ -507,6 +511,12 @@ impl pipe::Sink for StreamSink {
             );
             return Ok(data);
         }
+        if self.write_fin_sent || self.socket.is_local_write_closed(self.stream_id) {
+            return Err(io::Error::new(
+                ErrorKind::BrokenPipe,
+                format!("H3 stream {} write side closed", self.stream_id),
+            ));
+        }
 
         let orig_len = data.len();
         let data = self.socket.write(self.stream_id, data)?;
@@ -527,18 +537,33 @@ impl pipe::Sink for StreamSink {
 
     fn eof(&mut self) -> io::Result<()> {
         // Must go through codec `on_stream_shutdown` so `write_shutdown` is set.
-        // Only one message: Drop will not send a second write-FIN.
+        // Only set write_fin_sent after a successful path so Drop can still try if send fails.
         if self.write_fin_sent {
             return Ok(());
         }
-        self.write_fin_sent = true;
-        self.codec_tx
-            .send(StreamMessage::Shutdown(
-                self.stream_id,
-                Some(quiche::Shutdown::Write),
-            ))
-            .map_err(|e| io::Error::other(format!("Failed to send write-FIN message: {}", e)))?;
-        Ok(())
+        match self.codec_tx.send(StreamMessage::Shutdown(
+            self.stream_id,
+            Some(quiche::Shutdown::Write),
+        )) {
+            Ok(()) => {
+                self.write_fin_sent = true;
+                Ok(())
+            }
+            Err(e) => {
+                // Channel dead: last-resort direct FIN (same as codec would do).
+                log_id!(
+                    warn,
+                    self.id,
+                    "eof codec channel closed ({}); direct write-FIN stream={}",
+                    e,
+                    self.stream_id
+                );
+                self.socket
+                    .shutdown_stream(self.stream_id, quiche::Shutdown::Write);
+                self.write_fin_sent = true;
+                Ok(())
+            }
+        }
     }
 
     async fn wait_writable(&mut self) -> io::Result<()> {
@@ -561,16 +586,38 @@ impl pipe::Sink for StreamSink {
 
 impl http_codec::DroppingSink for StreamSink {
     fn write(&mut self, data: Bytes) -> io::Result<datagram_pipe::SendStatus> {
+        // Closed stream: hard error so upper layers stop (not silent Dropped).
+        if self.write_fin_sent || self.socket.is_local_write_closed(self.stream_id) {
+            return Err(io::Error::new(
+                ErrorKind::BrokenPipe,
+                format!("H3 stream {} write side closed", self.stream_id),
+            ));
+        }
         match self.socket.stream_capacity(self.stream_id) {
             Ok(n) if n >= net_utils::http3_data_frame_overhead(data.len()) + data.len() => (),
             Ok(_) => return Ok(datagram_pipe::SendStatus::Dropped),
+            Err(e) if e.kind() == ErrorKind::BrokenPipe => return Err(e),
             Err(e) => return Err(io::Error::other(e.to_string())),
         }
 
-        let unsent = self.socket.write(self.stream_id, data)?;
+        let want = data.len();
+        let unsent = match self.socket.write(self.stream_id, data) {
+            Ok(u) => u,
+            Err(e) if e.kind() == ErrorKind::BrokenPipe => return Err(e),
+            Err(e) => return Err(e),
+        };
         if unsent.is_empty() {
             Ok(datagram_pipe::SendStatus::Sent)
         } else {
+            // Datagram path is best-effort: partial/full drop is intentional (no queue).
+            log_id!(
+                debug,
+                self.id,
+                "DroppingSink partial/drop stream={} unsent={}/{}",
+                self.stream_id,
+                unsent.len(),
+                want
+            );
             Ok(datagram_pipe::SendStatus::Dropped)
         }
     }
@@ -581,13 +628,26 @@ impl Drop for StreamSink {
         if self.write_fin_sent {
             return;
         }
-        self.write_fin_sent = true;
         match self.codec_tx.send(StreamMessage::Shutdown(
             self.stream_id,
             Some(quiche::Shutdown::Write),
         )) {
-            Ok(_) => (),
-            Err(e) => log_id!(debug, self.id, "Failed to notify of write shutdown: {}", e),
+            Ok(()) => {
+                self.write_fin_sent = true;
+            }
+            Err(e) => {
+                // Last resort if codec loop is gone.
+                log_id!(
+                    debug,
+                    self.id,
+                    "Drop write-FIN channel closed ({}); direct shutdown stream={}",
+                    e,
+                    self.stream_id
+                );
+                self.socket
+                    .shutdown_stream(self.stream_id, quiche::Shutdown::Write);
+                self.write_fin_sent = true;
+            }
         }
     }
 }

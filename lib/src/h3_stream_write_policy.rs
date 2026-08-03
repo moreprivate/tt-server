@@ -10,8 +10,8 @@
 pub enum BodyWriteGate {
     /// Proceed with H3 body write under H3+QUIC locks.
     Allow,
-    /// Local write side is finished or FIN is in flight — do not append body
-    /// (would risk peer FINAL_SIZE_ERROR).
+    /// Local write side is finished, FIN in flight, or peer STOP_SENDING —
+    /// do not append body (FINAL_SIZE risk). Caller should surface BrokenPipe.
     RefuseClosed,
 }
 
@@ -30,16 +30,18 @@ pub enum BodyWriteErrorAction {
     /// Capacity — retry later; stream still open.
     RetryLater,
     /// Peer stop / local already finished / transport final-size: retire write side;
-    /// **do not** issue empty write-FIN afterward.
-    RetireNoFurtherFin,
-    /// Unexpected — surface to caller.
+    /// **do not** issue empty write-FIN afterward. Surface error to upper layers.
+    RetireNoFurtherFin {
+        /// Peer sent STOP_SENDING (cancel); not a local double-FIN bug.
+        peer_stop_sending: bool,
+    },
+    /// Unexpected — surface to caller as hard error.
     Fatal,
 }
 
 /// Gate body write given local FIN state.
 ///
-/// `fin_pending` / `fin_done` must be re-checked under the same H3+QUIC locks
-/// that protect `send_body`.
+/// Flags must be re-checked under the same H3+QUIC locks that protect `send_body`.
 pub fn gate_body_write(fin_pending: bool, fin_done: bool, peer_stopped: bool) -> BodyWriteGate {
     if fin_pending || fin_done || peer_stopped {
         BodyWriteGate::RefuseClosed
@@ -58,9 +60,6 @@ pub fn gate_write_fin(fin_done: bool, peer_stopped: bool) -> WriteFinGate {
 }
 
 /// Classify quiche/H3 body errors that the multiplexer maps into lifecycle actions.
-///
-/// Inputs are flags derived from the real error enum at the call site so this
-/// stays free of quiche types and is easy to unit-test.
 pub fn classify_body_write_error(
     stream_blocked_or_done: bool,
     peer_stop_sending: bool,
@@ -72,9 +71,23 @@ pub fn classify_body_write_error(
         return BodyWriteErrorAction::RetryLater;
     }
     if peer_stop_sending || final_size || invalid_stream_state || frame_unexpected {
-        return BodyWriteErrorAction::RetireNoFurtherFin;
+        return BodyWriteErrorAction::RetireNoFurtherFin { peer_stop_sending };
     }
     BodyWriteErrorAction::Fatal
+}
+
+/// Whether a refuse-closed body write is a permanent hard error for upper layers.
+pub fn refuse_closed_is_hard_error(
+    fin_pending: bool,
+    fin_done: bool,
+    peer_stopped: bool,
+) -> bool {
+    // All refuse cases are permanent for this stream write side (FIN in flight means
+    // no more body; done/stopped means closed).
+    matches!(
+        gate_body_write(fin_pending, fin_done, peer_stopped),
+        BodyWriteGate::RefuseClosed
+    )
 }
 
 #[cfg(test)]
@@ -83,10 +96,7 @@ mod tests {
 
     #[test]
     fn body_refused_after_fin_pending_or_done_or_peer_stop() {
-        assert_eq!(
-            gate_body_write(false, false, false),
-            BodyWriteGate::Allow
-        );
+        assert_eq!(gate_body_write(false, false, false), BodyWriteGate::Allow);
         assert_eq!(
             gate_body_write(true, false, false),
             BodyWriteGate::RefuseClosed
@@ -99,6 +109,10 @@ mod tests {
             gate_body_write(false, false, true),
             BodyWriteGate::RefuseClosed
         );
+        assert!(refuse_closed_is_hard_error(true, false, false));
+        assert!(refuse_closed_is_hard_error(false, true, false));
+        assert!(refuse_closed_is_hard_error(false, false, true));
+        assert!(!refuse_closed_is_hard_error(false, false, false));
     }
 
     #[test]
@@ -117,19 +131,27 @@ mod tests {
         );
         assert_eq!(
             classify_body_write_error(false, true, false, false, false),
-            BodyWriteErrorAction::RetireNoFurtherFin
+            BodyWriteErrorAction::RetireNoFurtherFin {
+                peer_stop_sending: true
+            }
         );
         assert_eq!(
             classify_body_write_error(false, false, true, false, false),
-            BodyWriteErrorAction::RetireNoFurtherFin
+            BodyWriteErrorAction::RetireNoFurtherFin {
+                peer_stop_sending: false
+            }
         );
         assert_eq!(
             classify_body_write_error(false, false, false, true, false),
-            BodyWriteErrorAction::RetireNoFurtherFin
+            BodyWriteErrorAction::RetireNoFurtherFin {
+                peer_stop_sending: false
+            }
         );
         assert_eq!(
             classify_body_write_error(false, false, false, false, true),
-            BodyWriteErrorAction::RetireNoFurtherFin
+            BodyWriteErrorAction::RetireNoFurtherFin {
+                peer_stop_sending: false
+            }
         );
         assert_eq!(
             classify_body_write_error(false, false, false, false, false),
@@ -137,11 +159,12 @@ mod tests {
         );
     }
 
-    /// Regression: post-STOP must never allow body then FIN (the FINAL_SIZE poison order).
     #[test]
     fn peer_stop_blocks_body_and_fin() {
-        let g = gate_body_write(false, false, true);
-        assert_eq!(g, BodyWriteGate::RefuseClosed);
+        assert_eq!(
+            gate_body_write(false, false, true),
+            BodyWriteGate::RefuseClosed
+        );
         assert_eq!(gate_write_fin(false, true), WriteFinGate::Skip);
     }
 }
