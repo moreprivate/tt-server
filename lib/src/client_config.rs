@@ -52,7 +52,10 @@ pub fn build(
         anti_dpi: false,
         name: name.unwrap_or_default(),
         dns_upstreams: if dns_upstreams.is_empty() {
-            DEFAULT_DNS_UPSTREAMS.iter().map(|s| (*s).to_string()).collect()
+            DEFAULT_DNS_UPSTREAMS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect()
         } else {
             dns_upstreams
         },
@@ -97,7 +100,7 @@ pub struct ClientConfig {
     name: String,
     /// DNS upstreams to use when connected to this endpoint
     dns_upstreams: Vec<String>,
-    /// Parallel upstream sessions for HTTP/2 or HTTP/3 (0 = client library default; 1–8)
+    /// Parallel upstream sessions for HTTP/2 or HTTP/3 (0 = client library default of 8; 1–8)
     http_connections_num: u32,
 }
 
@@ -125,7 +128,10 @@ impl ClientConfig {
             doc["name"] = value(&self.name);
         }
         let dns = if self.dns_upstreams.is_empty() {
-            DEFAULT_DNS_UPSTREAMS.iter().map(|s| (*s).to_string()).collect::<Vec<_>>()
+            DEFAULT_DNS_UPSTREAMS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect::<Vec<_>>()
         } else {
             self.dns_upstreams.clone()
         };
