@@ -51,9 +51,17 @@ pub fn build(
         upstream_protocol: "http2".into(),
         anti_dpi: false,
         name: name.unwrap_or_default(),
-        dns_upstreams,
+        dns_upstreams: if dns_upstreams.is_empty() {
+            DEFAULT_DNS_UPSTREAMS.iter().map(|s| (*s).to_string()).collect()
+        } else {
+            dns_upstreams
+        },
+        http_connections_num: 0,
     }
 }
+
+/// Default DNS written into exported client configs (Cloudflare).
+const DEFAULT_DNS_UPSTREAMS: &[&str] = &["1.1.1.1", "1.0.0.1"];
 
 #[cfg_attr(feature = "rt_doc", derive(Getter, RuntimeDoc))]
 pub struct ClientConfig {
@@ -89,6 +97,8 @@ pub struct ClientConfig {
     name: String,
     /// DNS upstreams to use when connected to this endpoint
     dns_upstreams: Vec<String>,
+    /// Parallel upstream sessions for HTTP/2 or HTTP/3 (0 = client library default; 1–8)
+    http_connections_num: u32,
 }
 
 impl ClientConfig {
@@ -110,13 +120,17 @@ impl ClientConfig {
         }
         doc["upstream_protocol"] = value(&self.upstream_protocol);
         doc["anti_dpi"] = value(self.anti_dpi);
+        doc["http_connections_num"] = value(self.http_connections_num as i64);
         if !self.name.is_empty() {
             doc["name"] = value(&self.name);
         }
-        if !self.dns_upstreams.is_empty() {
-            let vec = toml_edit::Array::from_iter(self.dns_upstreams.iter().map(|x| x.as_str()));
-            doc["dns_upstreams"] = value(vec);
-        }
+        let dns = if self.dns_upstreams.is_empty() {
+            DEFAULT_DNS_UPSTREAMS.iter().map(|s| (*s).to_string()).collect::<Vec<_>>()
+        } else {
+            self.dns_upstreams.clone()
+        };
+        let vec = toml_edit::Array::from_iter(dns.iter().map(|x| x.as_str()));
+        doc["dns_upstreams"] = value(vec);
         doc.to_string()
     }
 
@@ -213,10 +227,13 @@ upstream_protocol = ""
 anti_dpi = false
 
 {}
+http_connections_num = 0
+
+{}
 name = ""
 
 {}
-dns_upstreams = []
+dns_upstreams = ["1.1.1.1", "1.0.0.1"]
 "#,
         ClientConfig::doc_hostname().to_toml_comment(),
         ClientConfig::doc_addresses().to_toml_comment(),
@@ -229,6 +246,7 @@ dns_upstreams = []
         ClientConfig::doc_certificate().to_toml_comment(),
         ClientConfig::doc_upstream_protocol().to_toml_comment(),
         ClientConfig::doc_anti_dpi().to_toml_comment(),
+        ClientConfig::doc_http_connections_num().to_toml_comment(),
         ClientConfig::doc_name().to_toml_comment(),
         ClientConfig::doc_dns_upstreams().to_toml_comment(),
     )
@@ -254,6 +272,7 @@ mod tests {
                 anti_dpi: false,
                 name: String::new(),
                 dns_upstreams: vec![],
+                http_connections_num: 0,
             }
         }
     }
