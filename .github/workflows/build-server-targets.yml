@@ -63,12 +63,14 @@ jobs:
     runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.build_runner == 'self-hosted' && 'docker-runner' || 'ubuntu-24.04' }}
     timeout-minutes: 360
     container:
-      image: adguard/core-libs:2.12
+      image: adguard/core-libs@sha256:26f7e1c6c19b1e2c90a8938e6c763469787fbaeff94f8c5a887b947aa8858f5e
     env:
       # Keep cargo, cargo-zigbuild, and boring-sys on the image's native
       # /opt/cargo path.  Mixing this with a different CARGO_HOME makes the
       # generated CMake toolchain point at a registry path that does not exist.
       CARGO_HOME: /opt/cargo
+      # Keep Rust source/debug paths independent of the checkout mount.
+      RUSTFLAGS: --remap-path-prefix=/__w/tt-server/tt-server=/tt-server --remap-path-prefix=/workspace/tt-server=/tt-server
 
     steps:
       - name: Check out source ref
@@ -113,9 +115,10 @@ jobs:
     runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.build_runner == 'self-hosted' && 'docker-runner' || 'ubuntu-24.04' }}
     timeout-minutes: 360
     container:
-      image: adguard/core-libs:2.12
+      image: adguard/core-libs@sha256:26f7e1c6c19b1e2c90a8938e6c763469787fbaeff94f8c5a887b947aa8858f5e
     env:
       CARGO_HOME: /opt/cargo
+      RUSTFLAGS: --remap-path-prefix=/__w/tt-server/tt-server=/tt-server --remap-path-prefix=/workspace/tt-server=/tt-server
 
     steps:
       - name: Check out source ref
@@ -179,29 +182,22 @@ jobs:
       - name: Build server binary
         shell: bash
         env:
-          TARGET: ${{ matrix.target }}
+          ARCH: ${{ matrix.arch }}
           TT_ENDPOINT_VERSION: ${{ needs.source.outputs.release_tag }}
         run: |
-          cargo zigbuild \
-            --release \
-            --locked \
-            --target "${TARGET}" \
-            --bin trusttunnel_endpoint
+          ./scripts/ci/build-musl-target.sh \
+            "${ARCH}" "${TT_ENDPOINT_VERSION}" \
+            "artifacts/${ARCH}/tt-server-${TT_ENDPOINT_VERSION}-linux-${ARCH}"
 
       - name: Prepare artifact
         shell: bash
         env:
           ARCH: ${{ matrix.arch }}
-          TARGET: ${{ matrix.target }}
           RELEASE_TAG: ${{ needs.source.outputs.release_tag }}
           SOURCE_SHA: ${{ needs.source.outputs.source_sha }}
         run: |
           mkdir -p "artifacts/${ARCH}"
-          llvm-strip \
-            -o "artifacts/${ARCH}/tt-server-${RELEASE_TAG}-linux-${ARCH}" \
-            "target/${TARGET}/release/trusttunnel_endpoint"
           BINARY="artifacts/${ARCH}/tt-server-${RELEASE_TAG}-linux-${ARCH}"
-          chmod 755 "${BINARY}"
           case "${ARCH}" in
             x86_64)
               llvm-readelf -h "${BINARY}" | grep -Fq 'X86-64'
