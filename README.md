@@ -1,55 +1,51 @@
 # TrustTunnel server
 
-This repository builds the TrustTunnel server for a Linux VPS. It accepts
+TrustTunnel server is the Linux VPS endpoint for the private
+[tt-client](https://github.com/moreprivate/tt-client) and
+[tt-mobile](https://github.com/moreprivate/tt-mobile) clients. It accepts
 authenticated TCP, UDP, and ICMP traffic over HTTP/1.1, HTTP/2, or QUIC.
 
-Related repositories:
-
-- [tt-client](https://github.com/moreprivate/tt-client) — console and native clients
-- [tt-mobile](https://github.com/moreprivate/tt-mobile) — Flutter mobile client
-- [tt-manage](https://github.com/moreprivate/tt-manage) — installation and administration scripts
+Deployment scripts are in [tt-manage](https://github.com/moreprivate/tt-manage);
+this repository contains the endpoint source, tests, and release workflow.
 
 ## Install a release
 
-Run the manager as root on a supported Debian/Ubuntu VPS:
+On a supported Debian/Ubuntu VPS, run the manager as root:
 
 ```sh
 git clone https://github.com/moreprivate/tt-manage.git
 cd tt-manage
-sudo bash tt-server.sh install \
-  --custom-sni camouflage.example
-```
-
-`--custom-sni` is mandatory. It must be an ASCII DNS hostname, not an IP
-address. The manager installs the selected server release under
-`/opt/trusttunnel`, creates the systemd service, configures the firewall, and
-obtains a certificate unless `--skip-certbot` is specified.
-
-Install a specific release or a locally built binary with:
-
-```sh
-sudo bash tt-server.sh install --custom-sni camouflage.example \
-  --version RELEASE_TAG
-sudo bash tt-server.sh install --custom-sni camouflage.example \
-  --local ./tt-server-RELEASE_TAG-linux-x86_64
-```
-
-Release assets use the form `tt-server-RELEASE_TAG-linux-ARCH` and include
-checksums and a manifest.
-
-## Add clients
-
-The server may run with no users; that is a deliberate deny-all state. Add a
-user and copy the generated TOML to the client device:
-
-```sh
+sudo bash tt-server.sh install --custom-sni camouflage.example
 sudo bash tt-server.sh add-user router
-sudo cp /opt/trusttunnel/clients/router.toml /secure/path/router.toml
 ```
 
-The generated profile contains the server address, SNI, credentials, and the
-default four HTTP/2 connections. Keep it private. Use the same TOML with
-`tt-client`, `tt-client-openwrt.sh`, or the mobile app.
+`--custom-sni` is required and must be an ASCII DNS hostname, not an IP
+address. Installation configures the systemd service, firewall, certificates,
+and endpoint. Generated profiles are stored in
+`/opt/trusttunnel/clients/`; copy them securely to clients.
+
+Generated profiles default to:
+
+```toml
+upstream_protocol = "http2"
+http_connections_num = 0
+```
+
+`0` selects the client's default connection count. Select another transport
+with `--upstream-protocol auto|http2|http3`. The endpoint supports H2 and H3
+regardless of the profile choice. The endpoint may run with no users; this is
+a deliberate deny-all state.
+
+To pin an asset or use a local build:
+
+```sh
+sudo bash tt-server.sh install --custom-sni camouflage.example \\
+  --version RELEASE_TAG
+sudo bash tt-server.sh install --custom-sni camouflage.example \\
+  --binary ./tt-server-RELEASE_TAG-linux-x86_64
+```
+
+Release downloads require the matching checksum sidecar and manifest.
 
 ## Administration
 
@@ -64,45 +60,42 @@ sudo bash tt-server.sh enable
 sudo bash tt-server.sh purge
 ```
 
-`install` is for a clean installation. Use `upgrade` for an installed server;
-it preserves the current working binary for rollback. `purge` removes the
-TrustTunnel installation and policy but leaves the operating system intact.
-
-After an upgrade or configuration change:
-
-```sh
-sudo systemctl --no-pager --full status trusttunnel
-```
+`upgrade` changes only the endpoint binary and preserves configuration,
+credentials, certificates, and firewall state. `rollback` returns to the
+previous retained binary. `purge` removes TrustTunnel while leaving the
+operating system intact.
 
 ## Verify a session
 
-On the VPS, established client sessions on the standard listener are visible
-with:
-
 ```sh
+sudo systemctl --no-pager --full status trusttunnel
 sudo ss -tn state established '( sport = :443 )'
 ```
 
-The server-side health check also reports the configured ICMP egress interface
-and `CAP_NET_RAW` status. For client-side routing and leak checks, use the
-client repository's documentation.
+`status` also reports the configured ICMP egress interface and whether the
+service has `CAP_NET_RAW`, which is required for tunneled ICMP.
 
-## Build from source
+## Build and test
+
+For native development:
 
 ```sh
 make init
 cargo build --bins --release
+cargo test --workspace
 ```
 
-See [DEVELOPMENT.md](DEVELOPMENT.md) for prerequisites, tests, cross-builds,
-and local configuration. The build workflow runs manually from the
-`privacy/server-hardening` branch; upstream rebasing is intentionally manual.
+See [DEVELOPMENT.md](DEVELOPMENT.md) for prerequisites and debugging. The
+reproducible cross-target workflow is
+`.github/workflows/build-server-targets.yml`; it is manually dispatched and
+is invoked by the `tt-manage` release chain before client and mobile builds.
 
-## Configuration and certificates
+## Documentation
 
-- [CONFIGURATION.md](CONFIGURATION.md) — server and client configuration
-- [CERT_RENEWAL.md](CERT_RENEWAL.md) — certificate renewal
-- [VERIFY_RELEASES.md](VERIFY_RELEASES.md) — release and checksum verification
+- [CONFIGURATION.md](CONFIGURATION.md)
+- [CERT_RENEWAL.md](CERT_RENEWAL.md)
+- [VERIFY_RELEASES.md](VERIFY_RELEASES.md)
+- [DEVELOPMENT.md](DEVELOPMENT.md)
 
 ## License
 
