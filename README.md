@@ -1,12 +1,12 @@
-# TrustTunnel server
+# MorePrivate tt-server
 
-TrustTunnel server is the Linux VPS endpoint for the private
+[tt-server](https://github.com/moreprivate/tt-server) is the Linux VPS TrustTunnel server for the 
 [tt-client](https://github.com/moreprivate/tt-client) and
 [tt-mobile](https://github.com/moreprivate/tt-mobile) clients. It accepts
 authenticated TCP, UDP, and ICMP traffic over HTTP/1.1, HTTP/2, or QUIC.
 
 Deployment scripts are in [tt-manage](https://github.com/moreprivate/tt-manage);
-this repository contains the endpoint source, tests, and release workflow.
+this repository contains the server source, tests, and release workflow.
 
 ## Install a release
 
@@ -21,7 +21,7 @@ sudo bash tt-server.sh add-user router
 
 `--custom-sni` is required and must be an ASCII DNS hostname, not an IP
 address. Installation configures the systemd service, firewall, certificates,
-and endpoint. Generated profiles are stored in
+and server. Generated profiles are stored in
 `/opt/moreprivate/tt-server/clients/`; copy them securely to clients.
 
 Generated profiles default to:
@@ -32,8 +32,8 @@ http_connections_num = 0
 ```
 
 `0` selects the client's default connection count. Select another transport
-with `--upstream-protocol auto|http2|http3`. The endpoint supports H2 and H3
-regardless of the profile choice. The endpoint may run with no users; this is
+with `--upstream-protocol auto|http2|http3`. The server supports H2 and H3
+regardless of the profile choice. The server may run with no users; this is
 a deliberate deny-all state.
 
 To pin an asset or use a local build:
@@ -60,7 +60,7 @@ sudo bash tt-server.sh enable
 sudo bash tt-server.sh purge
 ```
 
-`upgrade` changes only the endpoint binary and preserves configuration,
+`upgrade` changes only the server binary and preserves configuration,
 credentials, certificates, and firewall state. `rollback` returns to the
 previous retained binary. `purge` removes TrustTunnel while leaving the
 operating system intact.
