@@ -22,7 +22,7 @@ sudo bash tt-server.sh add-user router
 `--custom-sni` is required and must be an ASCII DNS hostname, not an IP
 address. Installation configures the systemd service, firewall, certificates,
 and endpoint. Generated profiles are stored in
-`/opt/trusttunnel/clients/`; copy them securely to clients.
+`/opt/moreprivate/tt-server/clients/`; copy them securely to clients.
 
 Generated profiles default to:
 
@@ -68,7 +68,7 @@ operating system intact.
 ## Verify a session
 
 ```sh
-sudo systemctl --no-pager --full status trusttunnel
+sudo systemctl --no-pager --full status moreprivate-tt-server
 sudo ss -tn state established '( sport = :443 )'
 ```
 
