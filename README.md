@@ -1,6 +1,6 @@
 # MorePrivate tt-server
 
-[tt-server](https://github.com/moreprivate/tt-server) is the Linux VPS TrustTunnel server for the 
+[tt-server](https://github.com/moreprivate/tt-server) is the Linux VPS TrustTunnel server for the
 [tt-client](https://github.com/moreprivate/tt-client) and
 [tt-mobile](https://github.com/moreprivate/tt-mobile) clients. It accepts
 authenticated TCP, UDP, and ICMP traffic over HTTP/1.1, HTTP/2, or QUIC.
