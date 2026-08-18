@@ -59,7 +59,7 @@ pub fn build(
         } else {
             dns_upstreams
         },
-        http_connections_num: 0,
+        http_connections_num: 4,
     }
 }
 
@@ -100,7 +100,7 @@ pub struct ClientConfig {
     name: String,
     /// DNS upstreams to use when connected to this endpoint
     dns_upstreams: Vec<String>,
-    /// Parallel upstream sessions for HTTP/2 or HTTP/3 (0 = client library default of 8; 1–8)
+    /// Parallel upstream sessions for HTTP/2 or HTTP/3 (TOML default 4; 1–8, with 0 selecting the client library default of 8)
     http_connections_num: u32,
 }
 
@@ -233,7 +233,7 @@ upstream_protocol = ""
 anti_dpi = false
 
 {}
-http_connections_num = 0
+http_connections_num = 4
 
 {}
 name = ""
@@ -278,7 +278,7 @@ mod tests {
                 anti_dpi: false,
                 name: String::new(),
                 dns_upstreams: vec![],
-                http_connections_num: 0,
+                http_connections_num: 4,
             }
         }
     }
