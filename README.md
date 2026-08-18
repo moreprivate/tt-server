@@ -1,6 +1,6 @@
 # MorePrivate tt-server
 
-[tt-server](https://github.com/moreprivate/tt-server) is the Linux VPS TrustTunnel server for the 
+[tt-server](https://github.com/moreprivate/tt-server) is the Linux VPS TrustTunnel server for the
 [tt-client](https://github.com/moreprivate/tt-client) and
 [tt-mobile](https://github.com/moreprivate/tt-mobile) clients. It accepts
 authenticated TCP, UDP, and ICMP traffic over HTTP/1.1, HTTP/2, or QUIC.
@@ -28,10 +28,11 @@ Generated profiles default to:
 
 ```toml
 upstream_protocol = "http2"
-http_connections_num = 0
+http_connections_num = 4
 ```
 
-`0` selects the client's default connection count. Select another transport
+`4` is the generated TOML default; setting it to `0` selects the client
+library fallback of 8. Select another transport
 with `--upstream-protocol auto|http2|http3`. The server supports H2 and H3
 regardless of the profile choice. The server may run with no users; this is
 a deliberate deny-all state.
