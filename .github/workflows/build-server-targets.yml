@@ -70,7 +70,7 @@ jobs:
       # generated CMake toolchain point at a registry path that does not exist.
       CARGO_HOME: /opt/cargo
       # Keep Rust source/debug paths independent of the checkout mount.
-      RUSTFLAGS: --remap-path-prefix=/__w/tt-server/tt-server=/tt-server --remap-path-prefix=/workspace/tt-server=/tt-server
+      RUSTFLAGS: --remap-path-prefix=/__w/tt-server/tt-server=/tt-server --remap-path-prefix=/workspace/tt-server=/tt-server --remap-path-prefix=/opt/cargo=/cargo
 
     steps:
       - name: Check out source ref
@@ -118,7 +118,7 @@ jobs:
       image: adguard/core-libs@sha256:26f7e1c6c19b1e2c90a8938e6c763469787fbaeff94f8c5a887b947aa8858f5e
     env:
       CARGO_HOME: /opt/cargo
-      RUSTFLAGS: --remap-path-prefix=/__w/tt-server/tt-server=/tt-server --remap-path-prefix=/workspace/tt-server=/tt-server
+      RUSTFLAGS: --remap-path-prefix=/__w/tt-server/tt-server=/tt-server --remap-path-prefix=/workspace/tt-server=/tt-server --remap-path-prefix=/opt/cargo=/cargo
 
     steps:
       - name: Check out source ref

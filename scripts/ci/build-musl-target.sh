@@ -20,4 +20,7 @@ cargo zigbuild --release --locked --target "$target" --bin trusttunnel_endpoint
 mkdir -p "$(dirname "$output")"
 llvm-strip -o "$output" "target/$target/release/trusttunnel_endpoint"
 chmod 755 "$output"
-llvm-readelf -h "$output" | grep -Fq "$expected"
+header_dump=$(mktemp)
+trap 'rm -f "$header_dump"' EXIT
+llvm-readelf -h "$output" >"$header_dump"
+grep -Fq "$expected" "$header_dump"
