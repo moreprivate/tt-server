@@ -5,6 +5,7 @@ use base64::Engine;
 use serde::Deserialize;
 use std::borrow::Cow;
 use std::collections::HashSet;
+use std::sync::RwLock;
 
 /// A client descriptor
 #[derive(Deserialize)]
@@ -26,18 +27,22 @@ pub struct Client {
 /// The [`Authenticator`] implementation which checks presence of a client in the list.
 /// Is only able to authenticate a client using the Proxy basic authorization.
 pub struct RegistryBasedAuthenticator {
-    clients: HashSet<Cow<'static, str>>,
+    clients: RwLock<HashSet<Cow<'static, str>>>,
 }
 
 impl RegistryBasedAuthenticator {
     pub fn new(clients: &[Client]) -> Self {
         Self {
-            clients: clients
-                .iter()
-                .map(|x| BASE64_ENGINE.encode(format!("{}:{}", x.username, x.password)))
-                .map(Cow::Owned)
-                .collect(),
+            clients: RwLock::new(Self::encode_clients(clients)),
         }
+    }
+
+    fn encode_clients(clients: &[Client]) -> HashSet<Cow<'static, str>> {
+        clients
+            .iter()
+            .map(|x| BASE64_ENGINE.encode(format!("{}:{}", x.username, x.password)))
+            .map(Cow::Owned)
+            .collect()
     }
 }
 
@@ -51,11 +56,19 @@ impl Authenticator for RegistryBasedAuthenticator {
             authentication::Source::ProxyBasic(str) => str,
             authentication::Source::Sni(str) => str,
         };
-        if self.clients.contains(creds.as_ref()) {
+        if self.clients.read().unwrap().contains(creds.as_ref()) {
             authentication::Status::Pass
         } else {
             authentication::Status::Reject
         }
+    }
+
+    fn uses_client_registry(&self) -> bool {
+        true
+    }
+
+    fn reload_clients(&self, clients: &[Client]) {
+        *self.clients.write().unwrap() = Self::encode_clients(clients);
     }
 }
 
@@ -72,6 +85,62 @@ mod tests {
         assert!(matches!(
             authenticator.authenticate(&source, &id),
             authentication::Status::Reject
+        ));
+    }
+
+    #[test]
+    fn reload_replaces_registry() {
+        let old = Client {
+            username: "old".into(),
+            password: "password".into(),
+            max_http2_conns: None,
+            max_http3_conns: None,
+        };
+        let new = Client {
+            username: "new".into(),
+            password: "password".into(),
+            max_http2_conns: None,
+            max_http3_conns: None,
+        };
+        let authenticator = RegistryBasedAuthenticator::new(&[old]);
+        let id = log_utils::IdChain::<u64>::empty();
+
+        authenticator.reload_clients(&[new]);
+        assert!(matches!(
+            authenticator.authenticate(
+                &authentication::Source::ProxyBasic(BASE64_ENGINE.encode("old:password").into()),
+                &id,
+            ),
+            authentication::Status::Reject
+        ));
+        assert!(matches!(
+            authenticator.authenticate(
+                &authentication::Source::ProxyBasic(BASE64_ENGINE.encode("new:password").into()),
+                &id,
+            ),
+            authentication::Status::Pass
+        ));
+    }
+
+    #[test]
+    fn reload_can_add_first_client_to_empty_registry() {
+        let authenticator = RegistryBasedAuthenticator::new(&[]);
+        let client = Client {
+            username: "new".into(),
+            password: "password".into(),
+            max_http2_conns: None,
+            max_http3_conns: None,
+        };
+        let id = log_utils::IdChain::<u64>::empty();
+
+        authenticator.reload_clients(&[client]);
+
+        assert!(matches!(
+            authenticator.authenticate(
+                &authentication::Source::ProxyBasic(BASE64_ENGINE.encode("new:password").into()),
+                &id,
+            ),
+            authentication::Status::Pass
         ));
     }
 }

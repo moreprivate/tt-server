@@ -98,12 +98,29 @@ impl Tunnel {
     async fn listen_inner(&mut self) -> io::Result<()> {
         loop {
             log_id!(trace, self.id, "Tunnel waiting for request");
-            let request = match tokio::time::timeout(
+            let listen = tokio::time::timeout(
                 self.context.settings.client_listener_timeout,
                 self.downstream.listen(),
-            )
-            .await
-            {
+            );
+            let listen_result = match self.connection_guard.as_ref() {
+                Some(guard) => {
+                    let mut revoked = guard.revocation_receiver();
+                    tokio::select! {
+                        _ = ConnectionGuard::wait_for_revocation(&mut revoked) => None,
+                        result = listen => Some(result),
+                    }
+                }
+                None => Some(listen.await),
+            };
+            let Some(listen_result) = listen_result else {
+                log_id!(debug, self.id, "Client credentials revoked, closing tunnel");
+                self.downstream.graceful_shutdown().await?;
+                return Err(io::Error::new(
+                    ErrorKind::PermissionDenied,
+                    "Client credentials revoked",
+                ));
+            };
+            let request = match listen_result {
                 Ok(Ok(None)) => {
                     log_id!(debug, self.id, "Tunnel closed gracefully");
                     return Ok(());
@@ -186,113 +203,172 @@ impl Tunnel {
                 }
             }
 
-            tokio::spawn(async move {
-                fn report_fatal_if_too_many_open_files(
-                    context: &Arc<core::Context>,
-                    e: &ConnectionError,
-                ) {
-                    if let ConnectionError::Io(io) = e {
-                        if core::Core::is_too_many_open_files_error(io) {
-                            context.report_fatal_io_error(io);
-                        }
+            if let Some(guard) = self.connection_guard.as_ref() {
+                if let Ok(Some(source)) = request.auth_info() {
+                    if !guard.matches_credentials(&source) {
+                        log_id!(
+                            debug,
+                            self.id,
+                            "Credentials changed within an authenticated tunnel"
+                        );
+                        request.fail_request(ConnectionError::Authentication(
+                            "Credentials do not match the authenticated tunnel".to_string(),
+                        ));
+                        return Err(io::Error::new(
+                            ErrorKind::PermissionDenied,
+                            "Credentials changed within an authenticated tunnel",
+                        ));
                     }
                 }
+            }
 
-                let request_id = request.id();
-                log_id!(trace, request_id, "Processing tunnel request");
-                let auth_info = request
-                    .auth_info()
-                    .map(|x| x.map(authentication::Source::into_owned));
-                let forwarder_auth = match (
-                    auth_info,
+            let revocation = self
+                .connection_guard
+                .as_ref()
+                .map(ConnectionGuard::revocation_receiver);
+            let revocation_log_id = self.id.clone();
+            tokio::spawn(async move {
+                let process_request = Tunnel::process_request(
+                    context,
+                    forwarder,
+                    request,
                     authentication_policy,
-                    context.authenticator.clone(),
-                ) {
-                    (Ok(Some(source)), _, Some(authenticator)) => {
-                        match authenticator.authenticate(&source, &log_id) {
-                            Status::Pass => Some(source),
-                            Status::Reject => {
-                                let err = ConnectionError::Authentication(
-                                    "Authentication failed".to_string(),
+                    tls_domain,
+                    update_metrics,
+                    log_id,
+                );
+
+                match revocation {
+                    Some(mut revoked) => {
+                        tokio::select! {
+                            _ = ConnectionGuard::wait_for_revocation(&mut revoked) => {
+                                log_id!(
+                                    debug,
+                                    revocation_log_id,
+                                    "Client credentials revoked, dropping active request"
                                 );
-                                log_id!(debug, request_id, "{}", err);
-                                request.fail_request(err);
-                                return;
                             }
+                            _ = process_request => {}
                         }
                     }
-                    (Ok(None), AuthenticationPolicy::Authenticated(x), Some(_)) => Some(x),
-                    (Ok(x), policy, None) => x.or(match policy {
-                        AuthenticationPolicy::Default => None,
-                        AuthenticationPolicy::Authenticated(y) => Some(y),
-                    }),
-                    (Ok(None), AuthenticationPolicy::Default, Some(_)) => {
-                        let err = ConnectionError::Authentication(
-                            "Got request without authentication info on non-authenticated connection".to_string()
-                        );
+                    None => process_request.await,
+                }
+            });
+        }
+    }
+
+    async fn process_request<F>(
+        context: Arc<core::Context>,
+        forwarder: Arc<Mutex<Box<dyn Forwarder>>>,
+        request: Box<dyn downstream::PendingMultiplexedRequest>,
+        authentication_policy: AuthenticationPolicy<'static>,
+        tls_domain: String,
+        update_metrics: F,
+        log_id: log_utils::IdChain<u64>,
+    ) where
+        F: Fn(pipe::SimplexDirection, usize) + Send + Clone + Sync,
+    {
+        fn report_fatal_if_too_many_open_files(context: &Arc<core::Context>, e: &ConnectionError) {
+            if let ConnectionError::Io(io) = e {
+                if core::Core::is_too_many_open_files_error(io) {
+                    context.report_fatal_io_error(io);
+                }
+            }
+        }
+
+        let request_id = request.id();
+        log_id!(trace, request_id, "Processing tunnel request");
+        let auth_info = request
+            .auth_info()
+            .map(|x| x.map(authentication::Source::into_owned));
+        let forwarder_auth = match (
+            auth_info,
+            authentication_policy,
+            context.authenticator.clone(),
+        ) {
+            (Ok(Some(source)), _, Some(authenticator)) => {
+                match authenticator.authenticate(&source, &log_id) {
+                    Status::Pass => Some(source),
+                    Status::Reject => {
+                        let err =
+                            ConnectionError::Authentication("Authentication failed".to_string());
                         log_id!(debug, request_id, "{}", err);
                         request.fail_request(err);
                         return;
                     }
-                    (Err(e), ..) => {
-                        log_id!(debug, request_id, "Failed to get auth info: {}", e);
-                        request.fail_request(ConnectionError::Io(e));
-                        return;
-                    }
-                };
-
-                log_id!(
-                    trace,
-                    request_id,
-                    "Authentication complete, promoting request"
+                }
+            }
+            (Ok(None), AuthenticationPolicy::Authenticated(x), Some(_)) => Some(x),
+            (Ok(x), policy, None) => x.or(match policy {
+                AuthenticationPolicy::Default => None,
+                AuthenticationPolicy::Authenticated(y) => Some(y),
+            }),
+            (Ok(None), AuthenticationPolicy::Default, Some(_)) => {
+                let err = ConnectionError::Authentication(
+                    "Got request without authentication info on non-authenticated connection"
+                        .to_string(),
                 );
-                match request.promote_to_next_state() {
-                    Ok(None) => {
-                        log_id!(trace, request_id, "Health check request completed");
-                    }
-                    Ok(Some(PendingDemultiplexedRequest::TcpConnect(request))) => {
-                        log_id!(trace, request_id, "Handling TCP connect request");
-                        if let Err((request, message, e)) = Tunnel::on_tcp_connect_request(
-                            context.clone(),
-                            forwarder,
-                            request,
-                            forwarder_auth,
-                            tls_domain,
-                            update_metrics,
-                        )
-                        .await
-                        {
-                            report_fatal_if_too_many_open_files(&context, &e);
-                            log_id!(debug, request_id, "{}: {}", message, e);
-                            if let Some(request) = request {
-                                request.fail_request(e);
-                            }
-                        }
-                    }
-                    Ok(Some(PendingDemultiplexedRequest::DatagramMultiplexer(request))) => {
-                        log_id!(trace, request_id, "Handling datagram multiplexer request");
-                        if let Err((request, message, e)) = Tunnel::on_datagram_mux_request(
-                            context.clone(),
-                            forwarder,
-                            request,
-                            forwarder_auth,
-                            tls_domain,
-                            update_metrics,
-                        )
-                        .await
-                        {
-                            report_fatal_if_too_many_open_files(&context, &e);
-                            log_id!(debug, request_id, "{}: {}", message, e);
-                            if let Some(request) = request {
-                                request.fail_request(e);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        log_id!(debug, request_id, "Failed to complete request: {}", e);
+                log_id!(debug, request_id, "{}", err);
+                request.fail_request(err);
+                return;
+            }
+            (Err(e), ..) => {
+                log_id!(debug, request_id, "Failed to get auth info: {}", e);
+                request.fail_request(ConnectionError::Io(e));
+                return;
+            }
+        };
+
+        log_id!(
+            trace,
+            request_id,
+            "Authentication complete, promoting request"
+        );
+        match request.promote_to_next_state() {
+            Ok(None) => {
+                log_id!(trace, request_id, "Health check request completed");
+            }
+            Ok(Some(PendingDemultiplexedRequest::TcpConnect(request))) => {
+                log_id!(trace, request_id, "Handling TCP connect request");
+                if let Err((request, message, e)) = Tunnel::on_tcp_connect_request(
+                    context.clone(),
+                    forwarder,
+                    request,
+                    forwarder_auth,
+                    tls_domain,
+                    update_metrics,
+                )
+                .await
+                {
+                    report_fatal_if_too_many_open_files(&context, &e);
+                    log_id!(debug, request_id, "{}: {}", message, e);
+                    if let Some(request) = request {
+                        request.fail_request(e);
                     }
                 }
-            });
+            }
+            Ok(Some(PendingDemultiplexedRequest::DatagramMultiplexer(request))) => {
+                log_id!(trace, request_id, "Handling datagram multiplexer request");
+                if let Err((request, message, e)) = Tunnel::on_datagram_mux_request(
+                    context.clone(),
+                    forwarder,
+                    request,
+                    forwarder_auth,
+                    tls_domain,
+                    update_metrics,
+                )
+                .await
+                {
+                    report_fatal_if_too_many_open_files(&context, &e);
+                    log_id!(debug, request_id, "{}: {}", message, e);
+                    if let Some(request) = request {
+                        request.fail_request(e);
+                    }
+                }
+            }
+            Err(e) => {
+                log_id!(debug, request_id, "Failed to complete request: {}", e);
+            }
         }
     }
 

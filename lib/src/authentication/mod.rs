@@ -35,6 +35,16 @@ pub enum Status {
 pub trait Authenticator: Send + Sync {
     /// Authenticate client
     fn authenticate(&self, source: &Source<'_>, log_id: &log_utils::IdChain<u64>) -> Status;
+
+    /// Whether this authenticator uses the clients from the endpoint settings.
+    #[doc(hidden)]
+    fn uses_client_registry(&self) -> bool {
+        false
+    }
+
+    /// Replace the clients used by this authenticator.
+    #[doc(hidden)]
+    fn reload_clients(&self, _clients: &[registry_based::Client]) {}
 }
 
 impl Source<'_> {

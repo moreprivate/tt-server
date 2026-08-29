@@ -38,6 +38,7 @@ const NAME_PARAM_NAME: &str = "name";
 const DNS_UPSTREAM_PARAM_NAME: &str = "dns_upstream";
 const SENTRY_DSN_PARAM_NAME: &str = "sentry_dsn";
 const THREADS_NUM_PARAM_NAME: &str = "threads_num";
+const RELOAD_STATUS_FILE_PARAM_NAME: &str = "reload_status_file";
 const TRUSTTUNNEL_QR_URL: &str = "https://trusttunnel.org/qr.html";
 
 #[cfg(unix)]
@@ -110,10 +111,14 @@ fn main() {
                 .action(clap::ArgAction::Set)
                 .value_parser(clap::value_parser!(usize))
                 .help("The number of worker threads. If not specified, set to the number of CPUs on the machine."),
+            clap::Arg::new(RELOAD_STATUS_FILE_PARAM_NAME)
+                .long("reload-status-file")
+                .action(clap::ArgAction::Set)
+                .help("Write the result of each SIGHUP client reload to this file."),
             clap::Arg::new(SETTINGS_PARAM_NAME)
                 .action(clap::ArgAction::Set)
                 .required_unless_present(VERSION_PARAM_NAME)
-                .help("Path to a settings file"),
+                .help("Path to a settings file. Sending SIGHUP reloads configured clients."),
             clap::Arg::new(TLS_HOSTS_SETTINGS_PARAM_NAME)
                 .action(clap::ArgAction::Set)
                 .required_unless_present(VERSION_PARAM_NAME)
@@ -236,6 +241,10 @@ fn main() {
     increase_fd_limit();
 
     let settings_path = args.get_one::<String>(SETTINGS_PARAM_NAME).unwrap();
+    let reload_status_file = args
+        .get_one::<String>(RELOAD_STATUS_FILE_PARAM_NAME)
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("TT_RELOAD_STATUS_FILE").map(PathBuf::from));
     let settings_contents =
         std::fs::read_to_string(settings_path).expect("Couldn't read the settings file");
     let settings: Settings =
@@ -525,25 +534,56 @@ fn main() {
         async move { core.listen().await }
     };
 
-    let reload_tls_hosts_task = {
+    let reload_settings_task = {
+        let settings_path = settings_path.clone();
         let tls_hosts_settings_path = tls_hosts_settings_path.clone();
+        let reload_status_file = reload_status_file.clone();
         async move {
             let mut sighup_listener = signal::unix::signal(signal::unix::SignalKind::hangup())
                 .expect("Couldn't start SIGHUP listener");
 
             loop {
-                sighup_listener.recv().await;
-                info!("Reloading TLS hosts settings");
+                if sighup_listener.recv().await.is_none() {
+                    return;
+                }
+                info!("Reloading clients and TLS hosts settings");
 
-                let tls_hosts_settings: settings::TlsHostsSettings = toml::from_str(
-                    &std::fs::read_to_string(&tls_hosts_settings_path)
-                        .expect("Couldn't read the TLS hosts settings file"),
-                )
-                .expect("Couldn't parse the TLS hosts settings file");
+                let clients_reloaded = match std::fs::read_to_string(&settings_path)
+                    .map_err(|e| e.to_string())
+                    .and_then(|contents| {
+                        toml::from_str::<Settings>(&contents).map_err(|e| e.to_string())
+                    })
+                    .and_then(|settings| core.reload_clients(&settings).map_err(|e| e.to_string()))
+                {
+                    Ok(()) => {
+                        info!("Client settings are successfully reloaded");
+                        true
+                    }
+                    Err(e) => {
+                        error!("Failed to reload client settings: {}", e);
+                        false
+                    }
+                };
 
-                core.reload_tls_hosts_settings(tls_hosts_settings)
-                    .expect("Couldn't apply new settings");
-                info!("TLS hosts settings are successfully reloaded");
+                match std::fs::read_to_string(&tls_hosts_settings_path)
+                    .map_err(|e| e.to_string())
+                    .and_then(|contents| {
+                        toml::from_str::<settings::TlsHostsSettings>(&contents)
+                            .map_err(|e| e.to_string())
+                    })
+                    .and_then(|settings| {
+                        core.reload_tls_hosts_settings(settings)
+                            .map_err(|e| e.to_string())
+                    }) {
+                    Ok(()) => info!("TLS hosts settings are successfully reloaded"),
+                    Err(e) => error!("Failed to reload TLS hosts settings: {}", e),
+                }
+
+                if let Some(path) = reload_status_file.as_deref() {
+                    if let Err(e) = write_reload_status(path, clients_reloaded) {
+                        error!("Failed to write reload status: {}", e);
+                    }
+                }
             }
         }
     };
@@ -564,8 +604,8 @@ fn main() {
                     1
                 }
             },
-            _ = reload_tls_hosts_task => {
-                error!("Error while reloading TLS hosts");
+            _ = reload_settings_task => {
+                error!("Settings reload task stopped unexpectedly");
                 1
             },
             _ = interrupt_task => {
@@ -576,6 +616,12 @@ fn main() {
     });
 
     std::process::exit(exit_code);
+}
+
+fn write_reload_status(path: &Path, success: bool) -> std::io::Result<()> {
+    let temporary = path.with_extension(format!("tmp.{}", std::process::id()));
+    std::fs::write(&temporary, if success { "ok\n" } else { "error\n" })?;
+    std::fs::rename(temporary, path)
 }
 
 /// Returns the domain part of an address string if it is a domain (not an IP).
@@ -681,6 +727,17 @@ fn parse_endpoint_address(input: &str, default_port: u16) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reload_status_is_atomically_replaced() {
+        let path =
+            std::env::temp_dir().join(format!("trusttunnel_reload_status_{}", std::process::id()));
+        write_reload_status(&path, true).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "ok\n");
+        write_reload_status(&path, false).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "error\n");
+        std::fs::remove_file(path).unwrap();
+    }
 
     fn make_tls_hosts(hostnames: &[&str]) -> settings::TlsHostsSettings {
         use std::sync::atomic::{AtomicU64, Ordering};

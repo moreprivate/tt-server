@@ -1576,28 +1576,62 @@ fn parse_clients(content: &str) -> Result<Vec<Client>, String> {
         None => return Err("Expected an array of tables named 'client'".to_string()),
     };
 
+    let mut usernames = HashSet::with_capacity(client_tables.len());
     client_tables
         .iter()
         .enumerate()
         .map(|(idx, x)| {
-            let username = demangle_toml_string(x["username"].to_string());
-            let password = demangle_toml_string(x["password"].to_string());
+            let client_number = idx + 1;
+            let username = x
+                .get("username")
+                .and_then(Item::as_str)
+                .ok_or_else(|| format!("Client #{}: username must be a string", client_number))?
+                .trim()
+                .to_owned();
+            let password = x
+                .get("password")
+                .and_then(Item::as_str)
+                .ok_or_else(|| format!("Client #{}: password must be a string", client_number))?
+                .trim()
+                .to_owned();
 
             if username.is_empty() {
-                return Err(format!("Client #{}: username cannot be empty", idx + 1));
+                return Err(format!(
+                    "Client #{}: username cannot be empty",
+                    client_number
+                ));
             }
             if password.is_empty() {
-                return Err(format!("Client #{}: password cannot be empty", idx + 1));
+                return Err(format!(
+                    "Client #{}: password cannot be empty",
+                    client_number
+                ));
+            }
+            if !usernames.insert(username.clone()) {
+                return Err(format!(
+                    "Client #{}: duplicate username {:?}",
+                    client_number, username
+                ));
             }
 
-            let max_http2_conns = x
-                .get("max_http2_conns")
-                .and_then(Item::as_integer)
-                .and_then(|v| u32::try_from(v).ok());
-            let max_http3_conns = x
-                .get("max_http3_conns")
-                .and_then(Item::as_integer)
-                .and_then(|v| u32::try_from(v).ok());
+            let parse_limit = |name: &str| -> Result<Option<u32>, String> {
+                let Some(item) = x.get(name) else {
+                    return Ok(None);
+                };
+                let value = item.as_integer().ok_or_else(|| {
+                    format!("Client #{}: {} must be an integer", client_number, name)
+                })?;
+                u32::try_from(value).map(Some).map_err(|_| {
+                    format!(
+                        "Client #{}: {} must be between 0 and {}",
+                        client_number,
+                        name,
+                        u32::MAX
+                    )
+                })
+            };
+            let max_http2_conns = parse_limit("max_http2_conns")?;
+            let max_http3_conns = parse_limit("max_http3_conns")?;
 
             Ok(Client {
                 username,
@@ -1717,10 +1751,6 @@ fn validate_client_random_prefix(value: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn demangle_toml_string(x: String) -> String {
-    x.replace('"', "").trim().to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1735,9 +1765,34 @@ mod tests {
 
     #[test]
     fn malformed_nonempty_credentials_are_rejected() {
-        for content in ["clients = []", "[client]\nusername = 'a'\npassword = 'b'"] {
+        for content in [
+            "clients = []",
+            "[client]\nusername = 'a'\npassword = 'b'",
+            "[[client]]\npassword = 'b'",
+            "[[client]]\nusername = 'a'",
+            "[[client]]\nusername = 1\npassword = 'b'",
+            "[[client]]\nusername = 'a'\npassword = 1",
+            "[[client]]\nusername = 'a'\npassword = 'b'\nmax_http2_conns = -1",
+            "[[client]]\nusername = 'a'\npassword = 'b'\nmax_http3_conns = 4294967296",
+            "[[client]]\nusername = 'a'\npassword = 'b'\nmax_http2_conns = 'none'",
+            "[[client]]\nusername = 'a'\npassword = 'b'\n\n[[client]]\nusername = 'a'\npassword = 'c'",
+        ] {
             assert!(parse_clients(content).is_err(), "{content}");
         }
+    }
+
+    #[test]
+    fn credential_strings_and_zero_limits_are_preserved() {
+        let clients = parse_clients(
+            "[[client]]\nusername = 'alice'\npassword = ' c\"d '\nmax_http2_conns = 0\nmax_http3_conns = 0",
+        )
+        .unwrap();
+
+        assert_eq!(clients.len(), 1);
+        assert_eq!(clients[0].username, "alice");
+        assert_eq!(clients[0].password, "c\"d");
+        assert_eq!(clients[0].max_http2_conns, Some(0));
+        assert_eq!(clients[0].max_http3_conns, Some(0));
     }
 
     #[test]

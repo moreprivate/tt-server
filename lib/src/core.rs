@@ -123,7 +123,10 @@ impl Core {
 
         let (fatal_error, _fatal_error_rx) = watch::channel(None);
 
-        let connection_limiter = if settings.default_max_http2_conns_per_client.is_some()
+        let connection_limiter = if authenticator
+            .as_ref()
+            .is_some_and(|authenticator| authenticator.uses_client_registry())
+            || settings.default_max_http2_conns_per_client.is_some()
             || settings.default_max_http3_conns_per_client.is_some()
             || settings
                 .clients
@@ -234,6 +237,29 @@ impl Core {
         }
 
         *demux = TlsDemux::new(&self.context.settings, &settings)?;
+        Ok(())
+    }
+
+    /// Reload configured clients and revoke sessions for removed credentials.
+    pub fn reload_clients(&self, settings: &Settings) -> io::Result<()> {
+        let authenticator = self
+            .context
+            .authenticator
+            .as_ref()
+            .filter(|authenticator| authenticator.uses_client_registry())
+            .ok_or_else(|| io::Error::other("Client authenticator does not support reloading"))?;
+        let limiter = self
+            .context
+            .connection_limiter
+            .as_ref()
+            .ok_or_else(|| io::Error::other("Client session registry is not initialized"))?;
+
+        limiter.reload(
+            &settings.clients,
+            settings.default_max_http2_conns_per_client,
+            settings.default_max_http3_conns_per_client,
+        );
+        authenticator.reload_clients(&settings.clients);
         Ok(())
     }
 

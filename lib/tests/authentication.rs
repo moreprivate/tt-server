@@ -5,15 +5,21 @@ use http::Request;
 use log::info;
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use trusttunnel::authentication;
+use trusttunnel::authentication::registry_based::RegistryBasedAuthenticator;
+use trusttunnel::authentication::Authenticator;
+use trusttunnel::core::Core;
+use trusttunnel::net_utils;
 use trusttunnel::settings::{
-    ForwardProtocolSettings, Http1Settings, ListenProtocolSettings, Settings,
-    Socks5ForwarderSettings, TlsHostInfo, TlsHostsSettings,
+    ForwardProtocolSettings, Http1Settings, Http2Settings, ListenProtocolSettings, QuicSettings,
+    Settings, Socks5ForwarderSettings, TlsHostInfo, TlsHostsSettings,
 };
+use trusttunnel::shutdown::Shutdown;
 
 #[allow(dead_code)]
 mod common;
@@ -52,6 +58,233 @@ async fn registry_proxy_auth_failure() {
         _ = client_task => (),
         _ = tokio::time::sleep(Duration::from_secs(10)) => panic!("Timed out"),
     }
+}
+
+#[tokio::test]
+async fn removing_client_closes_active_tunnel_without_stopping_endpoint() {
+    common::set_up_logger();
+    let endpoint_address = common::make_endpoint_address();
+    let destination = TcpListener::bind((Ipv4Addr::LOCALHOST, 0u16))
+        .await
+        .unwrap();
+    let destination_address = destination.local_addr().unwrap();
+    let settings = make_registry_settings(&endpoint_address, true);
+    let reload_settings = make_registry_settings(&endpoint_address, false);
+    let cert_key_file = common::make_cert_key_file();
+    let cert_key_path = cert_key_file.path.to_str().unwrap();
+    let hosts_settings = TlsHostsSettings::builder()
+        .main_hosts(vec![TlsHostInfo {
+            hostname: common::MAIN_DOMAIN_NAME.to_string(),
+            cert_chain_path: cert_key_path.to_string(),
+            private_key_path: cert_key_path.to_string(),
+            allowed_sni: vec![],
+        }])
+        .build()
+        .unwrap();
+    let authenticator: Arc<dyn Authenticator> =
+        Arc::new(RegistryBasedAuthenticator::new(settings.get_clients()));
+    let core = Arc::new(
+        Core::new(
+            settings,
+            Some(authenticator),
+            hosts_settings,
+            Shutdown::new(),
+        )
+        .unwrap(),
+    );
+    let endpoint_task = tokio::spawn({
+        let core = core.clone();
+        async move { core.listen().await }
+    });
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mut stream =
+        common::establish_tls_connection(common::MAIN_DOMAIN_NAME, &endpoint_address, None).await;
+    let request = format!(
+        "CONNECT {destination_address} HTTP/1.1\r\nHost: {destination_address}\r\nProxy-Authorization: Basic {}\r\n\r\n",
+        BASE64_ENGINE.encode("a:b"),
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = Vec::new();
+    let mut byte = [0u8; 1];
+    while !response.ends_with(b"\r\n\r\n") {
+        stream.read_exact(&mut byte).await.unwrap();
+        response.push(byte[0]);
+    }
+    assert!(std::str::from_utf8(&response).unwrap().contains(" 200 "));
+
+    core.reload_clients(&reload_settings).unwrap();
+
+    let closed = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte))
+        .await
+        .expect("revoked tunnel was not closed");
+    assert!(matches!(closed, Ok(0) | Err(_)));
+    let rejected =
+        try_connect_raw(&endpoint_address, "a:b", &destination_address.to_string()).await;
+    assert!(
+        rejected.is_none() || rejected == Some(http::StatusCode::PROXY_AUTHENTICATION_REQUIRED)
+    );
+
+    core.reload_clients(&make_registry_settings(&endpoint_address, true))
+        .unwrap();
+    assert_eq!(
+        try_connect_raw(&endpoint_address, "a:b", &destination_address.to_string()).await,
+        Some(http::StatusCode::OK),
+        "the first client added after a deny-all reload must work without restarting"
+    );
+    assert!(!endpoint_task.is_finished());
+    endpoint_task.abort();
+}
+
+#[tokio::test]
+async fn removing_client_closes_active_http2_tunnel() {
+    common::set_up_logger();
+    let endpoint_address = common::make_endpoint_address();
+    let destination = TcpListener::bind((Ipv4Addr::LOCALHOST, 0u16))
+        .await
+        .unwrap();
+    let destination_address = destination.local_addr().unwrap();
+    let (core, endpoint_task, _cert_key_file) = start_reloadable_endpoint(endpoint_address).await;
+
+    let stream = common::establish_tls_connection(
+        common::MAIN_DOMAIN_NAME,
+        &endpoint_address,
+        Some(net_utils::HTTP2_ALPN.as_bytes()),
+    )
+    .await;
+    let (mut sender, connection) = hyper::client::conn::Builder::new()
+        .http2_only(true)
+        .handshake(stream)
+        .await
+        .unwrap();
+    let connection_task = tokio::spawn(async move { connection.await });
+    let response = sender
+        .send_request(
+            Request::connect(destination_address.to_string())
+                .version(http::Version::HTTP_2)
+                .header(
+                    http::header::PROXY_AUTHORIZATION,
+                    format!("Basic {}", BASE64_ENGINE.encode("a:b")),
+                )
+                .body(hyper::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let mut upgraded = hyper::upgrade::on(response).await.unwrap();
+
+    core.reload_clients(&make_registry_settings(&endpoint_address, false))
+        .unwrap();
+
+    let mut byte = [0u8; 1];
+    let closed = tokio::time::timeout(Duration::from_secs(2), upgraded.read(&mut byte))
+        .await
+        .expect("revoked HTTP/2 tunnel was not closed");
+    assert!(matches!(closed, Ok(0) | Err(_)));
+    assert!(!endpoint_task.is_finished());
+    connection_task.abort();
+    endpoint_task.abort();
+}
+
+#[tokio::test]
+async fn removing_client_closes_active_http3_tunnel() {
+    common::set_up_logger();
+    let endpoint_address = common::make_endpoint_address();
+    let destination = TcpListener::bind((Ipv4Addr::LOCALHOST, 0u16))
+        .await
+        .unwrap();
+    let destination_address = destination.local_addr().unwrap();
+    let (core, endpoint_task, _cert_key_file) = start_reloadable_endpoint(endpoint_address).await;
+
+    let mut session =
+        common::Http3Session::connect(&endpoint_address, common::MAIN_DOMAIN_NAME, None).await;
+    let (response, _) = session
+        .exchange(
+            Request::connect(destination_address.to_string())
+                .header(
+                    http::header::PROXY_AUTHORIZATION,
+                    format!("Basic {}", BASE64_ENGINE.encode("a:b")),
+                )
+                .body(hyper::Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(response.status, http::StatusCode::OK);
+
+    core.reload_clients(&make_registry_settings(&endpoint_address, false))
+        .unwrap();
+
+    let mut byte = [0u8; 1];
+    let closed = tokio::time::timeout(Duration::from_secs(2), session.recv(&mut byte))
+        .await
+        .expect("revoked HTTP/3 tunnel was not closed");
+    assert_eq!(closed, 0);
+    assert!(!endpoint_task.is_finished());
+    endpoint_task.abort();
+}
+
+async fn start_reloadable_endpoint(
+    endpoint_address: SocketAddr,
+) -> (
+    Arc<Core>,
+    tokio::task::JoinHandle<std::io::Result<()>>,
+    common::File,
+) {
+    let settings = make_registry_settings(&endpoint_address, true);
+    let cert_key_file = common::make_cert_key_file();
+    let cert_key_path = cert_key_file.path.to_str().unwrap();
+    let hosts_settings = TlsHostsSettings::builder()
+        .main_hosts(vec![TlsHostInfo {
+            hostname: common::MAIN_DOMAIN_NAME.to_string(),
+            cert_chain_path: cert_key_path.to_string(),
+            private_key_path: cert_key_path.to_string(),
+            allowed_sni: vec![],
+        }])
+        .build()
+        .unwrap();
+    let authenticator: Arc<dyn Authenticator> =
+        Arc::new(RegistryBasedAuthenticator::new(settings.get_clients()));
+    let core = Arc::new(
+        Core::new(
+            settings,
+            Some(authenticator),
+            hosts_settings,
+            Shutdown::new(),
+        )
+        .unwrap(),
+    );
+    let endpoint_task = tokio::spawn({
+        let core = core.clone();
+        async move { core.listen().await }
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    (core, endpoint_task, cert_key_file)
+}
+
+fn make_registry_settings(listen_address: &SocketAddr, with_client: bool) -> Settings {
+    let clients = if with_client {
+        vec![authentication::registry_based::Client {
+            username: "a".into(),
+            password: "b".into(),
+            max_http2_conns: None,
+            max_http3_conns: None,
+        }]
+    } else {
+        Vec::new()
+    };
+    Settings::builder()
+        .listen_address(listen_address)
+        .unwrap()
+        .listen_protocols(ListenProtocolSettings {
+            http1: Some(Http1Settings::builder().build()),
+            http2: Some(Http2Settings::builder().build()),
+            quic: Some(QuicSettings::builder().build()),
+        })
+        .allow_private_network_connections(true)
+        .clients(clients)
+        .build()
+        .unwrap()
 }
 
 #[tokio::test]

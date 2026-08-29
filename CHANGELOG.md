@@ -8,7 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- [Feature] Reload configured clients on SIGHUP without restarting the endpoint; removed credentials have their active tunnels terminated.
+
 ### Changed
+
+- Reject incomplete, duplicate, or invalid client entries instead of silently weakening connection limits during reload.
 
 ### Deprecated
 
